@@ -516,8 +516,8 @@ body.light-theme {
     justify-self: center;
     overflow: hidden;
     background-color: var(--container-color);
-    -webkit-filter: grayscale(90%);
-    filter: grayscale(90%);
+    /* -webkit-filter: grayscale(40%);
+    filter: grayscale(40%); */
     transition: .45s;
 }
 
@@ -526,6 +526,7 @@ body.light-theme {
     filter: grayscale(0%);
     transition: .45s;
     cursor: pointer;
+    border-radius: 2rem 2rem 2rem 2rem;
 }
 
 .about__data {
@@ -1164,8 +1165,8 @@ body.light-theme {
     }
     .about__img {
         width: 350px;
-        padding: 1rem;
-        border-radius: 21rem 1rem 1rem 11rem;
+        padding: 0.1rem;
+        border-radius: 2rem 2rem 2rem 2rem;
     }
     .about__data {
         text-align: initial;
