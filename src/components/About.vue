@@ -3,7 +3,7 @@ import { Download, Languages, MapPin } from '@lucide/vue'
 import { ref } from 'vue'
 
 import portrait from '@/assets/images/portrait.webp'
-import MatrixRain from '@/components/MatrixRain.vue'
+import MatrixWorld from '@/components/MatrixWorld.vue'
 import SectionHeading from '@/components/SectionHeading.vue'
 import { portfolio } from '@/data/portfolio'
 import { vReveal } from '@/directives/reveal'
@@ -30,24 +30,12 @@ const isPortraitHovered = ref(false)
             @pointerenter="isPortraitHovered = true"
             @pointerleave="isPortraitHovered = false"
           >
-            <img
+            <MatrixWorld
               :src="portrait"
               :alt="`Portrait of ${profile.name}`"
-              width="408"
-              height="612"
-              loading="lazy"
-              decoding="async"
-              class="size-full object-cover object-top"
-            />
-            <div
-              class="pointer-events-none absolute inset-0 bg-black transition-opacity duration-500"
-              :class="isPortraitHovered ? 'opacity-55' : 'opacity-0'"
-              aria-hidden="true"
-            />
-            <MatrixRain
-              :active="isPortraitHovered"
-              class="pointer-events-none absolute inset-0 transition-opacity duration-500"
-              :class="isPortraitHovered ? 'opacity-100' : 'opacity-0'"
+              :intensity="isPortraitHovered ? 1 : 0"
+              :opacity="0.85"
+              class="size-full"
             />
           </div>
         </figure>

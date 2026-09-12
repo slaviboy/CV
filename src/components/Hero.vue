@@ -46,9 +46,9 @@ const code: Line[] = [
     ['listOf', 'type'],
     ['(', 'plain'],
   ],
-  ...profile.focus.map<Line>((item) => [
+  ...profile.focus.map<Line>((item, index) => [
     [`        "${item}"`, 'string'],
-    [',', 'plain'],
+    ...(index === profile.focus.length - 1 ? [] : [[',', 'plain'] as Line[number]]),
   ]),
   [['    ),', 'plain']],
   [[')', 'plain']],
@@ -79,6 +79,12 @@ const lineEndOffsets = lineLengths.reduce<number[]>((offsets, length, index) => 
 const totalChars = lineEndOffsets[lineEndOffsets.length - 1] ?? 0
 
 const revealCount = ref(0)
+/** A wrong character currently shown right after the typed text, mid-correction. */
+const typoChar = ref<string | null>(null)
+
+// The same char-by-char order `revealCount` walks, flattened once so a typo can look ahead
+// at what the "correct" next character is (to pick a plausible fumble) without re-deriving it.
+const flatText = code.map((line) => line.map(([text]) => text).join('')).join('')
 
 const visibleCode = computed<Line[]>(() => {
   let consumed = 0
@@ -96,52 +102,87 @@ const activeLineIndex = computed(() => {
   return index === -1 ? lineLengths.length - 1 : index
 })
 
-type Phase = 'typing' | 'pausedFull' | 'erasing' | 'pausedEmpty'
-let phase: Phase = 'typing'
+// Adjacent QWERTY keys, so a "mistyped" character looks like a real slipped keystroke.
+const KEYBOARD_NEIGHBORS: Record<string, string> = {
+  a: 'sq',
+  b: 'vn',
+  c: 'xv',
+  d: 'sfe',
+  e: 'wrd',
+  f: 'dgr',
+  g: 'fht',
+  h: 'gjy',
+  i: 'uok',
+  j: 'hku',
+  k: 'jli',
+  l: 'ko',
+  m: 'n',
+  n: 'bm',
+  o: 'ipl',
+  p: 'ol',
+  q: 'wa',
+  r: 'etf',
+  s: 'ade',
+  t: 'ryg',
+  u: 'yij',
+  v: 'cb',
+  w: 'qes',
+  x: 'zc',
+  y: 'tuh',
+  z: 'xs',
+}
+
+function typoFor(correctChar: string) {
+  const lower = correctChar.toLowerCase()
+  const neighbors = KEYBOARD_NEIGHBORS[lower]
+  if (!neighbors) return correctChar
+  const pick = neighbors[Math.floor(Math.random() * neighbors.length)]!
+  return correctChar === lower ? pick : pick.toUpperCase()
+}
+
 let timeoutId = 0
 let visible = true
 
-function scheduleTick(delay: number) {
-  timeoutId = window.setTimeout(tick, delay)
+function schedule(fn: () => void, delay: number) {
+  timeoutId = window.setTimeout(fn, delay)
 }
 
-function tick() {
-  if (phase === 'typing') {
-    revealCount.value++
-    if (revealCount.value >= totalChars) {
-      phase = 'pausedFull'
-      scheduleTick(2200)
-      return
-    }
-    const atLineEnd = lineEndOffsets.includes(revealCount.value)
-    const thinkPause = Math.random() < 0.05
-    scheduleTick(
-      atLineEnd ? 260 + Math.random() * 220 : thinkPause ? 160 + Math.random() * 220 : 18 + Math.random() * 34,
-    )
+function typeStep() {
+  if (revealCount.value >= totalChars) {
+    schedule(eraseStep, 2200)
     return
   }
 
-  if (phase === 'pausedFull') {
-    phase = 'erasing'
-    scheduleTick(12)
+  const nextChar = flatText[revealCount.value] ?? ''
+  if (!typoChar.value && /[a-zA-Z]/.test(nextChar) && Math.random() < 0.1) {
+    typoChar.value = typoFor(nextChar)
+    schedule(fixTypoStep, 130 + Math.random() * 180)
     return
   }
 
-  if (phase === 'erasing') {
-    revealCount.value--
-    if (revealCount.value <= 0) {
-      revealCount.value = 0
-      phase = 'pausedEmpty'
-      scheduleTick(550)
-      return
-    }
-    scheduleTick(9 + Math.random() * 12)
+  revealCount.value++
+  const atLineEnd = lineEndOffsets.includes(revealCount.value)
+  const thinkPause = Math.random() < 0.05
+  schedule(
+    typeStep,
+    atLineEnd ? 260 + Math.random() * 220 : thinkPause ? 160 + Math.random() * 220 : 18 + Math.random() * 34,
+  )
+}
+
+function fixTypoStep() {
+  typoChar.value = null
+  schedule(typeStep, 70 + Math.random() * 90)
+}
+
+function eraseStep() {
+  typoChar.value = null
+  revealCount.value--
+  if (revealCount.value <= 0) {
+    revealCount.value = 0
+    schedule(typeStep, 550)
     return
   }
-
-  // pausedEmpty
-  phase = 'typing'
-  scheduleTick(30)
+  schedule(eraseStep, 9 + Math.random() * 12)
 }
 
 function stop() {
@@ -152,7 +193,7 @@ function stop() {
 function start() {
   stop()
   if (reducedMotion.value || !visible || document.hidden) return
-  scheduleTick(300)
+  schedule(typeStep, 300)
 }
 
 function onVisibilityChange() {
@@ -162,11 +203,11 @@ function onVisibilityChange() {
 
 watch(reducedMotion, (isReduced) => {
   stop()
+  typoChar.value = null
   if (isReduced) {
     revealCount.value = totalChars
     return
   }
-  phase = 'typing'
   revealCount.value = 0
   start()
 })
@@ -277,7 +318,7 @@ onBeforeUnmount(() => {
           </div>
           <pre
             class="overflow-x-auto px-5 py-5 font-mono text-[13px] leading-6"
-          ><code><span v-for="(line, index) in visibleCode" :key="index" class="block"><span class="mr-5 inline-block w-4 text-right text-subtle/60 select-none">{{ index + 1 }}</span><span v-for="([text, kind], tokenIndex) in line" :key="tokenIndex" :class="tokenClass[kind]">{{ text }}</span><span v-if="!reducedMotion && index === activeLineIndex" class="typing-cursor" aria-hidden="true"></span></span></code></pre>
+          ><code><span v-for="(line, index) in visibleCode" :key="index" class="block"><span class="mr-5 inline-block w-4 text-right text-subtle/60 select-none">{{ index + 1 }}</span><span v-for="([text, kind], tokenIndex) in line" :key="tokenIndex" :class="tokenClass[kind]">{{ text }}</span><span v-if="typoChar && index === activeLineIndex" class="text-danger">{{ typoChar }}</span><span v-if="!reducedMotion && index === activeLineIndex" class="typing-cursor" aria-hidden="true"></span></span></code></pre>
         </div>
       </div>
     </div>
