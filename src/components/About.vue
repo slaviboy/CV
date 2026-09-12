@@ -6,6 +6,7 @@ import portrait from '@/assets/images/portrait.webp'
 import portraitMask from '@/assets/images/portrait-mask.webp'
 import MatrixWorld from '@/components/MatrixWorld.vue'
 import SectionHeading from '@/components/SectionHeading.vue'
+import { useTheme } from '@/composables/useTheme'
 import { portfolio } from '@/data/portfolio'
 import { vReveal } from '@/directives/reveal'
 
@@ -13,6 +14,7 @@ const { profile, stats } = portfolio
 const cvUrl = profile.cvPdfPath ? `${import.meta.env.BASE_URL}${profile.cvPdfPath}` : undefined
 
 const isPortraitHovered = ref(false)
+const { isDark } = useTheme()
 </script>
 
 <template>
@@ -37,6 +39,8 @@ const isPortraitHovered = ref(false)
               :alt="`Portrait of ${profile.name}`"
               :intensity="isPortraitHovered ? 1 : 0"
               :opacity="0.85"
+              :color="isDark ? '#3ddc84' : '#0a7340'"
+              :bg-color="isDark ? '#0a0c0f' : '#f7f7f4'"
               class="size-full"
             />
           </div>

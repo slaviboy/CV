@@ -25,6 +25,10 @@ const props = withDefaults(
     opacity?: number
     fontSize?: number
     color?: string
+    /** Canvas backdrop. Its own lightness decides the rendering mode: on a dark backdrop code
+     * glows bright (classic Matrix); on a light one it inks in dark instead of washing out to
+     * white, so the effect still reads as "code" rather than just disappearing. */
+    bgColor?: string
   }>(),
   {
     maskSrc: '',
@@ -34,6 +38,7 @@ const props = withDefaults(
     opacity: 1,
     fontSize: 10,
     color: '#00ff66',
+    bgColor: '#050607',
   },
 )
 
@@ -45,6 +50,11 @@ const CHARS = 'アイウエオカキクケコサシスセソタチツテト01234
 function randomChar() {
   return CHARS[Math.floor(Math.random() * CHARS.length)]!
 }
+
+// Size tiers from background to foreground. More than two steps so the silhouette edge reads as
+// a gradient rather than a visible seam, while `tierCells` (below) keeps the per-frame cost to
+// exactly one visit per cell no matter how many tiers there are.
+const SIZE_TIERS = 5
 
 function hexToRgb(hex: string) {
   const clean = hex.replace('#', '')
@@ -61,8 +71,22 @@ function mix(a: { r: number; g: number; b: number }, b: { r: number; g: number; 
   }
 }
 
+function relativeLuma(c: { r: number; g: number; b: number }) {
+  return (0.2126 * c.r + 0.7152 * c.g + 0.0722 * c.b) / 255
+}
+
 const baseColor = () => hexToRgb(props.color)
-const headColor = () => mix(baseColor(), { r: 255, g: 255, b: 255 }, 0.78)
+const backdropColor = () => hexToRgb(props.bgColor)
+/** True when the backdrop is light enough that code needs to ink in dark rather than glow
+ * bright — additive ("lighter") blending only reads on a dark backdrop; on a light one it just
+ * washes out toward white, which is the "black background looks wrong so let's fix the colors
+ * and it just disappears" failure mode. */
+const onLightBg = () => relativeLuma(backdropColor()) > 0.5
+/** The head/emphasis tone: brightened toward white on a dark backdrop (a hot spark), darkened
+ * toward black on a light one (an inked-in point) — whichever direction reads as "more present"
+ * for that backdrop. */
+const headColor = () =>
+  onLightBg() ? mix(baseColor(), { r: 0, g: 0, b: 0 }, 0.55) : mix(baseColor(), { r: 255, g: 255, b: 255 }, 0.78)
 
 function rgbaOf(c: { r: number; g: number; b: number }, a: number) {
   return `rgba(${c.r},${c.g},${c.b},${Math.max(0, Math.min(1, a)).toFixed(3)})`
@@ -87,6 +111,8 @@ const medCanvas = document.createElement('canvas')
 const medContext = medCanvas.getContext('2d', { willReadFrequently: true })
 const maskCanvas = document.createElement('canvas')
 const maskContext = maskCanvas.getContext('2d', { willReadFrequently: true })
+const shadeCanvas = document.createElement('canvas')
+const shadeContext = shadeCanvas.getContext('2d', { willReadFrequently: true })
 const downA = document.createElement('canvas')
 const downACtx = downA.getContext('2d', { willReadFrequently: true })
 const downB = document.createElement('canvas')
@@ -135,7 +161,7 @@ let columns = 0
 let rows = 0
 let luminance = new Float32Array(0)
 /** How "foreground" each cell is (from the mask alpha) — separate from `luminance` (which
- * drives brightness/color) so it can also drive depth cues: glyph scale, glow, and parallax. */
+ * drives brightness/color) so it can also drive depth cues like glyph scale and glow. */
 let depthMask = new Float32Array(0)
 let headRow: number[] = []
 let colSpeed: number[] = []
@@ -144,16 +170,15 @@ let colTail: number[] = []
  * falling head, so the face reads as a dense, present texture rather than a passing sliver) and
  * rerolled occasionally for shimmer, with cells inside a column's falling head rerolled more. */
 let charGrid: string[] = []
+/** Cell indices bucketed by size tier (background→foreground), computed once whenever the mask
+ * is resampled — not per frame. `drawCode` then does exactly one pass per tier over only that
+ * tier's cells, so going from 2 tiers to N doesn't multiply how many cells get visited overall;
+ * it only changes how many times `ctx.font` gets set (a handful, still cheap). */
+let tierCells: number[][] = []
 
 // How dissolved into code the scene currently is: 0 = plain photo, 1 = full code. Eased toward
 // the intensity-derived target each frame so hover reads as a dissolve, not a hard cut.
 let transitionT = 0
-
-// Mouse parallax: the person (high depthMask) shifts noticeably, the background barely moves —
-// that differential is what sells "depth" rather than everything being one flat plane.
-const PARALLAX_PX = 7
-const pointerTarget = { x: 0, y: 0 }
-const pointer = { x: 0, y: 0 }
 
 function rand(min: number, max: number) {
   return min + Math.random() * (max - min)
@@ -174,6 +199,58 @@ function stretchAndGamma(raw: Float32Array, lowCutoff: number, highCutoff: numbe
   return out
 }
 
+// A fixed virtual light direction (from upper-left, mostly frontal) used to shade the pseudo
+// bump map below. Normalized once at module load.
+const LIGHT = (() => {
+  const x = -0.55,
+    y = -0.5,
+    z = 0.67
+  const len = Math.hypot(x, y, z)
+  return { x: x / len, y: y / len, z: z / len }
+})()
+
+/** Treats the photo's own brightness as a height field and derives a normal from its gradient
+ * (the standard height-map-to-normal trick), then lights that normal from a fixed direction —
+ * cheap pseudo bump-mapping. This is what makes cheekbones, a nose bridge, hair volume, and
+ * fabric folds read as actual raised/recessed surface rather than flat brightness, without any
+ * real depth data. Writes the result into `shadeCanvas` at the source's medium resolution;
+ * the caller downsamples it the same way as everything else. */
+function computeBumpShade(medW: number, medH: number) {
+  if (!medContext || !shadeContext) return
+  const gray = new Float32Array(medW * medH)
+  const src = medContext.getImageData(0, 0, medW, medH).data
+  for (let p = 0; p < gray.length; p++) {
+    const i = p * 4
+    gray[p] = (src[i]! + src[i + 1]! + src[i + 2]!) / (3 * 255)
+  }
+
+  const strength = 6
+  const shadeData = shadeContext.createImageData(medW, medH)
+  for (let y = 0; y < medH; y++) {
+    for (let x = 0; x < medW; x++) {
+      const p = y * medW + x
+      const xm1 = x > 0 ? p - 1 : p
+      const xp1 = x < medW - 1 ? p + 1 : p
+      const ym1 = y > 0 ? p - medW : p
+      const yp1 = y < medH - 1 ? p + medW : p
+      const gx = (gray[xp1]! - gray[xm1]!) * strength
+      const gy = (gray[yp1]! - gray[ym1]!) * strength
+      const nLen = Math.hypot(gx, gy, 1)
+      const nx = -gx / nLen
+      const ny = -gy / nLen
+      const nz = 1 / nLen
+      const shade = Math.max(0, Math.min(1, nx * LIGHT.x + ny * LIGHT.y + nz * LIGHT.z))
+      const v = Math.round(shade * 255)
+      const i4 = p * 4
+      shadeData.data[i4] = shadeData.data[i4 + 1] = shadeData.data[i4 + 2] = v
+      shadeData.data[i4 + 3] = 255
+    }
+  }
+  shadeCanvas.width = medW
+  shadeCanvas.height = medH
+  shadeContext.putImageData(shadeData, 0, 0)
+}
+
 /** Samples the photo down to one "how much code here" value per grid cell, cover-fit +
  * top-aligned to match `object-cover object-top`. Brightness alone can't tell dark hair or a
  * dark t-shirt from a dark background — it would suppress all three equally — so *where* the
@@ -181,12 +258,21 @@ function stretchAndGamma(raw: Float32Array, lowCutoff: number, highCutoff: numbe
  * transparent background) instead of brightness. The background still gets a dim, ambient
  * version of the same code (from the real photo's own brightness) so it doesn't go fully dark —
  * the mask's job is to make the person pop brighter against it, not to erase everything else. */
+function buildTierCells() {
+  tierCells = Array.from({ length: SIZE_TIERS }, () => [] as number[])
+  for (let idx = 0; idx < depthMask.length; idx++) {
+    const tier = Math.min(SIZE_TIERS - 1, Math.floor((depthMask[idx] ?? 0) * SIZE_TIERS))
+    tierCells[tier]!.push(idx)
+  }
+}
+
 function sampleLuminance() {
   luminance = new Float32Array(columns * rows)
   depthMask = new Float32Array(columns * rows)
   const image = sourceImage
   if (!sampleContext || !medContext || !image?.naturalWidth || !imageReady) {
     luminance.fill(0.5)
+    buildTierCells()
     return
   }
 
@@ -200,11 +286,13 @@ function sampleLuminance() {
   const dx = (medW - dw) / 2
   medContext.clearRect(0, 0, medW, medH)
   medContext.drawImage(image, dx, 0, dw, dh)
+  computeBumpShade(medW, medH)
 
   const lumaCtx = progressiveDownscale(medCanvas, columns, rows)
   const lumaSmall = lumaCtx?.getImageData(0, 0, columns, rows).data
   if (!lumaSmall) {
     luminance.fill(0.5)
+    buildTierCells()
     return
   }
 
@@ -215,10 +303,22 @@ function sampleLuminance() {
   }
   const lumaCurve = stretchAndGamma(rawLuma, 0.015, 0.015, 4)
 
+  const shadeCtx = progressiveDownscale(shadeCanvas, columns, rows)
+  const shadeSmall = shadeCtx?.getImageData(0, 0, columns, rows).data
+  const rawShade = new Float32Array(columns * rows)
+  if (shadeSmall) {
+    for (let cell = 0; cell < rawShade.length; cell++) {
+      rawShade[cell] = shadeSmall[cell * 4]! / 255
+    }
+  } else {
+    rawShade.fill(1)
+  }
+
   const mask = maskImage
   if (!maskContext || !mask?.naturalWidth || !maskReady) {
     // No mask loaded (yet) — fall back to brightness alone rather than showing nothing.
     luminance.set(lumaCurve)
+    buildTierCells()
     return
   }
 
@@ -234,24 +334,27 @@ function sampleLuminance() {
   const maskSmall = maskCtx?.getImageData(0, 0, columns, rows).data
   if (!maskSmall) {
     luminance.set(lumaCurve)
+    buildTierCells()
     return
   }
 
   const rawMask = new Float32Array(columns * rows)
   for (let cell = 0; cell < rawMask.length; cell++) {
     const alpha = maskSmall[cell * 4 + 3]! / 255
-    // Smoothstep rather than the raw alpha — gives the depth cues (scale/glow/parallax below) a
-    // gentler transition at the silhouette edge instead of a hard step.
+    // Smoothstep rather than the raw alpha — gives the depth cues (scale/glow below) a gentler
+    // transition at the silhouette edge instead of a hard step.
     rawMask[cell] = alpha * alpha * (3 - 2 * alpha)
   }
   depthMask.set(rawMask)
+  buildTierCells()
 
   // Dim, ambient rain over the whole frame (still shaped by the real photo's brightness, just
-  // faint) — then the mask blends in a much brighter, gamma-boosted version over the person, so
-  // it clearly pops out of the background rather than the background vanishing entirely.
+  // faint) — then the mask blends in a much brighter, gamma-boosted version over the person,
+  // itself modulated by the bump shade so the person's own surface — cheekbones, hair volume,
+  // fabric folds — reads with real highlight/shadow instead of flat brightness.
   for (let cell = 0; cell < luminance.length; cell++) {
     const background = 0.05 + rawLuma[cell]! ** 1.4 * 0.22
-    const person = 0.5 + lumaCurve[cell]! * 0.5
+    const person = (0.45 + lumaCurve[cell]! * 0.4) * (0.55 + rawShade[cell]! * 0.7)
     luminance[cell] = background + (person - background) * rawMask[cell]!
   }
 }
@@ -306,70 +409,58 @@ function drawPhoto(alpha: number) {
   c.restore()
 }
 
-/** Two size/glow/parallax tiers — background (far) and person (near) — rather than a truly
- * continuous per-cell scale, so `ctx.font` only changes twice a frame instead of once per glyph
- * (font changes are one of the pricier canvas state changes). That's enough to read as depth:
- * the person renders larger, glows, and shifts more with the mouse; the background stays small,
- * flat, and nearly still. */
 function drawCode(alpha: number) {
   if (!ctx || alpha <= 0.004) return
   const c = ctx
+  const light = onLightBg()
   c.save()
   c.globalAlpha = alpha
-  c.globalCompositeOperation = 'lighter'
+  c.globalCompositeOperation = light ? 'multiply' : 'lighter'
   c.textBaseline = 'top'
 
   const head = headColor()
   const base = baseColor()
-  const fg = props.fontSize
   const bg = props.fontSize * 0.78
-  const parallaxBg = { x: pointer.x * PARALLAX_PX * 0.12, y: pointer.y * PARALLAX_PX * 0.12 }
-  const parallaxFg = { x: pointer.x * PARALLAX_PX, y: pointer.y * PARALLAX_PX }
 
   // The whole grid is drawn every frame — that's what makes the face read as a dense, present
   // texture rather than a thin falling sliver. Each column's moving head then boosts brightness
   // and reroll frequency for the cells it currently passes through, layering motion on top.
-  for (let pass = 0; pass < 2; pass++) {
-    const isForeground = pass === 1
-    c.font = `600 ${(isForeground ? fg : bg).toFixed(1)}px ui-monospace, SFMono-Regular, Menlo, monospace`
-    const parallax = isForeground ? parallaxFg : parallaxBg
+  // Iterating `tierCells` (precomputed in sampleLuminance) rather than the full grid per tier
+  // keeps the total number of cells visited constant at columns*rows regardless of tier count.
+  for (let tier = 0; tier < SIZE_TIERS; tier++) {
+    const cells = tierCells[tier]
+    if (!cells || cells.length === 0) continue
+    const size = bg + (props.fontSize - bg) * (tier / (SIZE_TIERS - 1))
+    c.font = `600 ${size.toFixed(1)}px ui-monospace, SFMono-Regular, Menlo, monospace`
 
-    for (let row = 0; row < rows; row++) {
-      for (let col = 0; col < columns; col++) {
-        const idx = row * columns + col
-        const depth = depthMask[idx] ?? 0
-        if (isForeground !== depth >= 0.5) continue
+    for (const idx of cells) {
+      const luma = luminance[idx] ?? 0
+      if (luma <= 0.02) continue
 
-        const luma = luminance[idx] ?? 0
-        if (luma <= 0.02) continue
+      const col = idx % columns
+      const row = (idx - col) / columns
+      const tail = colTail[col]!
+      const dist = headRow[col]! - row
+      const boost = dist >= 0 && dist < tail ? 1 - dist / tail : 0
 
-        const tail = colTail[col]!
-        const dist = headRow[col]! - row
-        const boost = dist >= 0 && dist < tail ? 1 - dist / tail : 0
-
-        if (Math.random() < (boost > 0.5 ? 0.35 : 0.02)) {
-          charGrid[idx] = randomChar()
-        }
-
-        const a = Math.min(1, luma * (0.55 + boost * 0.85))
-        // Shadow blur is one of the pricier canvas operations per draw call — keep it rare
-        // (only the animated "head" cells passing through), not a permanent per-cell cost across
-        // the whole silhouette. Size and brightness alone already carry most of the depth cue.
-        const glow = isForeground && boost > 0.6 ? boost * 5 : 0
-        if (glow > 0) {
-          c.shadowColor = rgbaOf(base, Math.min(1, luma))
-          c.shadowBlur = glow
-          c.fillStyle = rgbaOf(mix(base, head, boost), a)
-        } else {
-          c.shadowBlur = 0
-          c.fillStyle = rgbaOf(base, a)
-        }
-        c.fillText(
-          charGrid[idx] ?? randomChar(),
-          col * props.fontSize + parallax.x,
-          row * props.fontSize + parallax.y,
-        )
+      if (Math.random() < (boost > 0.5 ? 0.35 : 0.02)) {
+        charGrid[idx] = randomChar()
       }
+
+      const a = Math.min(1, luma * (0.55 + boost * 0.85))
+      // Shadow blur is one of the pricier canvas operations per draw call — keep it rare (only
+      // the animated "head" cells passing through), not a permanent per-cell cost across the
+      // whole silhouette. Size and brightness alone already carry most of the depth cue.
+      const glow = boost > 0.6 ? boost * 5 : 0
+      if (glow > 0) {
+        c.shadowColor = rgbaOf(base, Math.min(1, luma))
+        c.shadowBlur = glow
+        c.fillStyle = rgbaOf(mix(base, head, boost), a)
+      } else {
+        c.shadowBlur = 0
+        c.fillStyle = rgbaOf(base, a)
+      }
+      c.fillText(charGrid[idx] ?? randomChar(), col * props.fontSize, row * props.fontSize)
     }
   }
 
@@ -381,7 +472,7 @@ function drawNoise(codeAlpha: number) {
   if (!ctx || codeAlpha <= 0.05) return
   const c = ctx
   c.save()
-  c.globalCompositeOperation = 'screen'
+  c.globalCompositeOperation = onLightBg() ? 'multiply' : 'screen'
   c.fillStyle = rgbaOf(baseColor(), 0.5)
   const dots = Math.round(24 * Math.min(1.6, (width * height) / (420 * 520)))
   for (let i = 0; i < dots; i++) {
@@ -399,7 +490,7 @@ function render() {
 
   // Solid backdrop first — as the photo's alpha drops toward 0, this is what's left behind it
   // instead of the page showing through, and it's what the code layer sits on.
-  c.fillStyle = 'rgb(5 6 7)'
+  c.fillStyle = props.bgColor
   c.fillRect(0, 0, width, height)
 
   drawPhoto(1 - transitionT)
@@ -428,12 +519,7 @@ function frame(time: number) {
   if (Math.abs(target - transitionT) < 0.002) transitionT = target
 
   const stillActive = target > 0 || transitionT > 0.001
-  if (stillActive) {
-    updateColumns(dt)
-    const lerp = Math.min(1, dt * 5)
-    pointer.x += (pointerTarget.x - pointer.x) * lerp
-    pointer.y += (pointerTarget.y - pointer.y) * lerp
-  }
+  if (stillActive) updateColumns(dt)
 
   render()
 
@@ -472,19 +558,6 @@ function start() {
 function onVisibilityChange() {
   if (document.hidden) stop()
   else start()
-}
-
-function onPointerMove(event: PointerEvent) {
-  const canvas = canvasRef.value
-  if (!canvas) return
-  const rect = canvas.getBoundingClientRect()
-  pointerTarget.x = (event.clientX - rect.left) / rect.width - 0.5
-  pointerTarget.y = (event.clientY - rect.top) / rect.height - 0.5
-}
-
-function onPointerLeave() {
-  pointerTarget.x = 0
-  pointerTarget.y = 0
 }
 
 function loadImage() {
@@ -551,16 +624,12 @@ onMounted(() => {
   if (wrapperRef.value) intersectionObserver.observe(wrapperRef.value)
 
   document.addEventListener('visibilitychange', onVisibilityChange)
-  wrapperRef.value?.addEventListener('pointermove', onPointerMove)
-  wrapperRef.value?.addEventListener('pointerleave', onPointerLeave)
 })
 
 onBeforeUnmount(() => {
   stop()
   resizeObserver?.disconnect()
   intersectionObserver?.disconnect()
-  wrapperRef.value?.removeEventListener('pointermove', onPointerMove)
-  wrapperRef.value?.removeEventListener('pointerleave', onPointerLeave)
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>
