@@ -37,8 +37,12 @@ const isPortraitHovered = ref(false)
               height="612"
               loading="lazy"
               decoding="async"
-              class="size-full object-cover object-top transition-[filter] duration-500"
-              :class="isPortraitHovered ? 'brightness-50' : 'brightness-100'"
+              class="size-full object-cover object-top"
+            />
+            <div
+              class="pointer-events-none absolute inset-0 bg-black transition-opacity duration-500"
+              :class="isPortraitHovered ? 'opacity-55' : 'opacity-0'"
+              aria-hidden="true"
             />
             <MatrixRain
               :active="isPortraitHovered"

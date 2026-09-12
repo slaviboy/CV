@@ -1,8 +1,9 @@
 <script setup lang="ts">
 /**
  * Decorative "digital rain" overlay for the portrait — animates only while `active` is true
- * (the parent toggles this on hover) so it costs nothing the rest of the time. Colored from
- * the theme's `--mesh` token, which is already the accent green in both light and dark mode.
+ * (the parent toggles this on hover) so it costs nothing the rest of the time. A fixed neon
+ * green is used (rather than the theme accent) so the effect reads as "Matrix" and stays
+ * punchy in both light and dark mode.
  */
 import { onBeforeUnmount, onMounted, useTemplateRef, watch } from 'vue'
 
@@ -14,23 +15,23 @@ const canvasRef = useTemplateRef<HTMLCanvasElement>('canvas')
 const reducedMotion = useReducedMotion()
 
 const FRAME_INTERVAL = 1000 / 24
-const FONT_SIZE = 15
+const FONT_SIZE = 16
 const CHARS = 'アイウエオカキクケコサシスセソタチツテト0123456789:・."=+-*<>'
+const HEAD_RGB = '214 255 226'
+const TRAIL_RGB = '43 255 110'
 
 let context: CanvasRenderingContext2D | null = null
 let width = 0
 let height = 0
 let columns = 0
 let drops: number[] = []
-let meshRgb = '61 220 132'
 
 let frameId = 0
 let lastFrame = 0
 let resizeObserver: ResizeObserver | null = null
-let themeObserver: MutationObserver | null = null
 
-function readThemeColor() {
-  meshRgb = getComputedStyle(document.documentElement).getPropertyValue('--mesh').trim() || meshRgb
+function randomChar() {
+  return CHARS[Math.floor(Math.random() * CHARS.length)]!
 }
 
 function setup() {
@@ -59,26 +60,32 @@ function draw() {
   // Fade old glyphs by reducing their alpha (not by painting opaque black), so the canvas
   // background stays transparent and the darkened photo underneath stays visible through it.
   ctx.globalCompositeOperation = 'destination-out'
-  ctx.fillStyle = 'rgb(0 0 0 / 0.12)'
+  ctx.fillStyle = 'rgb(0 0 0 / 0.08)'
   ctx.fillRect(0, 0, width, height)
   ctx.globalCompositeOperation = 'source-over'
 
-  ctx.font = `${FONT_SIZE}px ui-monospace, SFMono-Regular, Menlo, monospace`
+  ctx.font = `600 ${FONT_SIZE}px ui-monospace, SFMono-Regular, Menlo, monospace`
   ctx.textBaseline = 'top'
+  ctx.shadowColor = `rgb(${TRAIL_RGB} / 0.8)`
+  ctx.shadowBlur = 6
 
   for (let i = 0; i < columns; i++) {
-    const char = CHARS[Math.floor(Math.random() * CHARS.length)]!
     const x = i * FONT_SIZE
-    const y = drops[i]! * FONT_SIZE
+    const headY = drops[i]! * FONT_SIZE
 
-    ctx.fillStyle = `rgb(${meshRgb} / 0.9)`
-    ctx.fillText(char, x, y)
+    // Bright leading glyph, with a dimmer green one following it — the classic two-tone rain.
+    ctx.fillStyle = `rgb(${HEAD_RGB} / 0.95)`
+    ctx.fillText(randomChar(), x, headY)
+    ctx.fillStyle = `rgb(${TRAIL_RGB} / 0.75)`
+    ctx.fillText(randomChar(), x, headY - FONT_SIZE)
 
-    if (y > height && Math.random() > 0.975) {
+    if (headY > height && Math.random() > 0.975) {
       drops[i] = 0
     }
-    drops[i]! += 0.5 + Math.random() * 0.5
+    drops[i]! += 0.4 + Math.random() * 0.4
   }
+
+  ctx.shadowBlur = 0
 }
 
 function loop(time: number) {
@@ -113,10 +120,6 @@ watch(reducedMotion, (isReduced) => {
 })
 
 onMounted(() => {
-  readThemeColor()
-  themeObserver = new MutationObserver(readThemeColor)
-  themeObserver.observe(document.documentElement, { attributes: true, attributeFilter: ['class'] })
-
   resizeObserver = new ResizeObserver(() => {
     if (props.active) setup()
   })
@@ -128,7 +131,6 @@ onMounted(() => {
 onBeforeUnmount(() => {
   stop()
   resizeObserver?.disconnect()
-  themeObserver?.disconnect()
 })
 </script>
 

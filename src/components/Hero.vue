@@ -1,8 +1,10 @@
 <script setup lang="ts">
 import { ArrowDown, ArrowRight, MapPin } from '@lucide/vue'
+import { computed, onBeforeUnmount, onMounted, ref, useTemplateRef, watch } from 'vue'
 
 import HeroMesh from '@/components/HeroMesh.vue'
 import BrandIcon from '@/components/icons/BrandIcon.vue'
+import { useReducedMotion } from '@/composables/useReducedMotion'
 import { portfolio } from '@/data/portfolio'
 
 const { profile, socials } = portfolio
@@ -60,6 +62,141 @@ const tokenClass: Record<TokenKind, string> = {
   plain: 'text-muted',
   comment: 'text-(--code-comment) italic',
 }
+
+/**
+ * Typewriter effect for the code panel: types the snippet out, pauses, erases it, and loops —
+ * as if a developer were writing it live. `revealCount` is a single running character count
+ * across the whole snippet; each line's tokens are sliced from it in `visibleCode`.
+ */
+const panelRef = useTemplateRef<HTMLDivElement>('panel')
+const reducedMotion = useReducedMotion()
+
+const lineLengths = code.map((line) => line.reduce((sum, [text]) => sum + text.length, 0))
+const lineEndOffsets = lineLengths.reduce<number[]>((offsets, length, index) => {
+  offsets.push((offsets[index - 1] ?? 0) + length)
+  return offsets
+}, [])
+const totalChars = lineEndOffsets[lineEndOffsets.length - 1] ?? 0
+
+const revealCount = ref(0)
+
+const visibleCode = computed<Line[]>(() => {
+  let consumed = 0
+  return code.map((line) =>
+    line.map(([text, kind]) => {
+      const visible = Math.max(0, Math.min(text.length, revealCount.value - consumed))
+      consumed += text.length
+      return [text.slice(0, visible), kind] as Line[number]
+    }),
+  )
+})
+
+const activeLineIndex = computed(() => {
+  const index = lineEndOffsets.findIndex((end) => revealCount.value < end)
+  return index === -1 ? lineLengths.length - 1 : index
+})
+
+type Phase = 'typing' | 'pausedFull' | 'erasing' | 'pausedEmpty'
+let phase: Phase = 'typing'
+let timeoutId = 0
+let visible = true
+
+function scheduleTick(delay: number) {
+  timeoutId = window.setTimeout(tick, delay)
+}
+
+function tick() {
+  if (phase === 'typing') {
+    revealCount.value++
+    if (revealCount.value >= totalChars) {
+      phase = 'pausedFull'
+      scheduleTick(2200)
+      return
+    }
+    const atLineEnd = lineEndOffsets.includes(revealCount.value)
+    const thinkPause = Math.random() < 0.05
+    scheduleTick(
+      atLineEnd ? 260 + Math.random() * 220 : thinkPause ? 160 + Math.random() * 220 : 18 + Math.random() * 34,
+    )
+    return
+  }
+
+  if (phase === 'pausedFull') {
+    phase = 'erasing'
+    scheduleTick(12)
+    return
+  }
+
+  if (phase === 'erasing') {
+    revealCount.value--
+    if (revealCount.value <= 0) {
+      revealCount.value = 0
+      phase = 'pausedEmpty'
+      scheduleTick(550)
+      return
+    }
+    scheduleTick(9 + Math.random() * 12)
+    return
+  }
+
+  // pausedEmpty
+  phase = 'typing'
+  scheduleTick(30)
+}
+
+function stop() {
+  clearTimeout(timeoutId)
+  timeoutId = 0
+}
+
+function start() {
+  stop()
+  if (reducedMotion.value || !visible || document.hidden) return
+  scheduleTick(300)
+}
+
+function onVisibilityChange() {
+  if (document.hidden) stop()
+  else start()
+}
+
+watch(reducedMotion, (isReduced) => {
+  stop()
+  if (isReduced) {
+    revealCount.value = totalChars
+    return
+  }
+  phase = 'typing'
+  revealCount.value = 0
+  start()
+})
+
+let intersectionObserver: IntersectionObserver | null = null
+
+onMounted(() => {
+  if (reducedMotion.value) {
+    revealCount.value = totalChars
+  } else {
+    start()
+  }
+
+  if (panelRef.value) {
+    intersectionObserver = new IntersectionObserver(([entry]) => {
+      visible = entry?.isIntersecting ?? true
+      if (visible) start()
+      else stop()
+    })
+    intersectionObserver.observe(panelRef.value)
+  }
+
+  document.addEventListener('visibilitychange', onVisibilityChange)
+})
+
+onBeforeUnmount(() => {
+  stop()
+  intersectionObserver?.disconnect()
+  document.removeEventListener('visibilitychange', onVisibilityChange)
+})
 </script>
 
 <template>
@@ -129,6 +266,7 @@ const tokenClass: Record<TokenKind, string> = {
 
       <div class="hero-enter hero-enter-delayed hidden lg:block" aria-hidden="true">
         <div
+          ref="panel"
           class="overflow-hidden rounded-2xl border border-line bg-surface/85 shadow-2xl shadow-black/5 backdrop-blur-md dark:shadow-black/40"
         >
           <div class="flex items-center justify-between border-b border-line px-4 py-3">
@@ -139,7 +277,7 @@ const tokenClass: Record<TokenKind, string> = {
           </div>
           <pre
             class="overflow-x-auto px-5 py-5 font-mono text-[13px] leading-6"
-          ><code><span v-for="(line, index) in code" :key="index" class="block"><span class="mr-5 inline-block w-4 text-right text-subtle/60 select-none">{{ index + 1 }}</span><span v-for="([text, kind], tokenIndex) in line" :key="tokenIndex" :class="tokenClass[kind]">{{ text }}</span></span></code></pre>
+          ><code><span v-for="(line, index) in visibleCode" :key="index" class="block"><span class="mr-5 inline-block w-4 text-right text-subtle/60 select-none">{{ index + 1 }}</span><span v-for="([text, kind], tokenIndex) in line" :key="tokenIndex" :class="tokenClass[kind]">{{ text }}</span><span v-if="!reducedMotion && index === activeLineIndex" class="typing-cursor" aria-hidden="true"></span></span></code></pre>
         </div>
       </div>
     </div>
@@ -165,6 +303,22 @@ const tokenClass: Record<TokenKind, string> = {
 
 .scroll-cue {
   animation: scroll-cue 2.4s ease-in-out infinite;
+}
+
+.typing-cursor {
+  display: inline-block;
+  width: 0.5ch;
+  height: 1em;
+  margin-left: 1px;
+  vertical-align: text-bottom;
+  background: var(--accent);
+  animation: cursor-blink 0.9s steps(1) infinite;
+}
+
+@keyframes cursor-blink {
+  50% {
+    opacity: 0;
+  }
 }
 
 @keyframes hero-enter {
