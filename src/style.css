@@ -1,0 +1,215 @@
+@import 'tailwindcss';
+@import '@fontsource-variable/geist';
+@import '@fontsource-variable/geist-mono';
+
+/* Class-based dark mode: `.dark` on <html> is set before first paint by the inline script in
+   index.html and kept in sync by `useTheme()`. */
+@custom-variant dark (&:where(.dark, .dark *));
+
+/* ---------------------------------------------------------------------------------------------
+   Design tokens. Components use semantic utilities (bg-surface, text-muted, border-line, …),
+   so the whole palette is swapped by redefining these variables for dark mode.
+   --------------------------------------------------------------------------------------------- */
+:root {
+  --bg: #f7f7f4;
+  --surface: #ffffff;
+  --surface-2: #efefeb;
+  --line: #e2e2dc;
+  --line-strong: #cfcfc7;
+  --fg: #101316;
+  --muted: #545c64;
+  --subtle: #5f6770;
+  --accent: #0a7340;
+  --accent-strong: #075c33;
+  --accent-fg: #ffffff;
+  --accent-soft: rgb(10 115 64 / 0.08);
+  --accent-line: rgb(10 115 64 / 0.28);
+  --mesh: 10 115 64;
+  --danger: #b42318;
+  --danger-soft: rgb(180 35 24 / 0.07);
+
+  /* Kotlin snippet syntax colors */
+  --code-keyword: #9b3b8f;
+  --code-string: #0a7340;
+  --code-type: #1d5fa8;
+  --code-comment: #7a8189;
+
+  color-scheme: light;
+}
+
+.dark {
+  --bg: #0a0c0f;
+  --surface: #11151a;
+  --surface-2: #171c22;
+  --line: #222932;
+  --line-strong: #313a45;
+  --fg: #e8ecef;
+  --muted: #9ba5af;
+  --subtle: #87919b;
+  --accent: #3ddc84;
+  --accent-strong: #6be7a2;
+  --accent-fg: #04140b;
+  --accent-soft: rgb(61 220 132 / 0.09);
+  --accent-line: rgb(61 220 132 / 0.3);
+  --mesh: 61 220 132;
+  --danger: #ff8a7a;
+  --danger-soft: rgb(255 138 122 / 0.08);
+
+  --code-keyword: #d58cf0;
+  --code-string: #7fe0a8;
+  --code-type: #7cb7ff;
+  --code-comment: #6c7682;
+
+  color-scheme: dark;
+}
+
+@theme inline {
+  --font-sans:
+    'Geist Variable', ui-sans-serif, system-ui, -apple-system, 'Segoe UI', Roboto, sans-serif;
+  --font-mono:
+    'Geist Mono Variable', ui-monospace, SFMono-Regular, Menlo, Monaco, Consolas, monospace;
+
+  --color-bg: var(--bg);
+  --color-surface: var(--surface);
+  --color-surface-2: var(--surface-2);
+  --color-line: var(--line);
+  --color-line-strong: var(--line-strong);
+  --color-fg: var(--fg);
+  --color-muted: var(--muted);
+  --color-subtle: var(--subtle);
+  --color-accent: var(--accent);
+  --color-accent-strong: var(--accent-strong);
+  --color-accent-fg: var(--accent-fg);
+  --color-accent-soft: var(--accent-soft);
+  --color-accent-line: var(--accent-line);
+  --color-danger: var(--danger);
+  --color-danger-soft: var(--danger-soft);
+}
+
+@layer base {
+  html {
+    scroll-behavior: smooth;
+    /* Keep anchored sections clear of the sticky navigation. */
+    scroll-padding-top: 5rem;
+    -webkit-text-size-adjust: 100%;
+    text-rendering: optimizeLegibility;
+  }
+
+  body {
+    @apply bg-bg font-sans text-fg antialiased;
+    font-feature-settings: 'ss01', 'cv11';
+  }
+
+  ::selection {
+    background: var(--accent-line);
+  }
+
+  /* Visible, consistent keyboard focus everywhere. */
+  :focus-visible {
+    outline: 2px solid var(--accent);
+    outline-offset: 3px;
+    border-radius: 6px;
+  }
+
+  h1,
+  h2,
+  h3 {
+    text-wrap: balance;
+  }
+
+  p {
+    text-wrap: pretty;
+  }
+}
+
+@layer components {
+  .container-page {
+    @apply mx-auto w-full max-w-6xl px-5 sm:px-8;
+  }
+
+  .section {
+    @apply py-20 sm:py-28;
+  }
+
+  .btn {
+    @apply inline-flex items-center justify-center gap-2 rounded-full px-5 py-2.5 text-sm font-medium transition-[background-color,border-color,color,transform] duration-200 select-none active:scale-[0.98] disabled:pointer-events-none disabled:opacity-60;
+  }
+
+  /* Use together with `.btn`: class="btn btn-primary" */
+  .btn-primary {
+    @apply bg-accent text-accent-fg hover:bg-accent-strong;
+  }
+
+  .btn-secondary {
+    @apply border border-line-strong bg-surface text-fg hover:border-fg/40;
+  }
+
+  .icon-btn {
+    @apply inline-flex size-10 items-center justify-center rounded-full text-muted transition-colors duration-200 hover:bg-surface-2 hover:text-fg;
+  }
+
+  .chip {
+    @apply inline-flex items-center rounded-full border border-line bg-surface-2/60 px-2.5 py-0.5 text-xs font-medium text-muted;
+  }
+
+  .card {
+    @apply rounded-2xl border border-line bg-surface;
+  }
+
+  .field-label {
+    @apply mb-2 block text-sm font-medium text-fg;
+  }
+
+  .field-input {
+    @apply block w-full rounded-xl border border-line-strong bg-bg px-4 py-3 text-base text-fg transition-[border-color,box-shadow] duration-200 placeholder:text-subtle/80 hover:border-fg/30 focus:border-accent focus:ring-4 focus:ring-accent-soft focus:outline-none aria-invalid:border-danger aria-invalid:focus:ring-danger-soft;
+  }
+
+  .field-error {
+    @apply mt-2 flex items-center gap-1.5 text-sm text-danger;
+  }
+}
+
+/* ---------------------------------------------------------------------------------------------
+   Scroll reveal (see `v-reveal`). Elements are only hidden once JS has marked them, so content
+   is never lost if the observer is unavailable.
+   --------------------------------------------------------------------------------------------- */
+.reveal {
+  opacity: 0;
+  transform: translateY(14px);
+  transition:
+    opacity 0.6s cubic-bezier(0.2, 0.7, 0.2, 1),
+    transform 0.6s cubic-bezier(0.2, 0.7, 0.2, 1);
+  transition-delay: var(--reveal-delay, 0ms);
+}
+
+.reveal.is-visible {
+  opacity: 1;
+  transform: none;
+}
+
+/* Subtle cross-fade when switching themes (View Transitions API, progressive enhancement). */
+::view-transition-old(root),
+::view-transition-new(root) {
+  animation-duration: 0.28s;
+  animation-timing-function: ease;
+}
+
+@media (prefers-reduced-motion: reduce) {
+  html {
+    scroll-behavior: auto;
+  }
+
+  *,
+  *::before,
+  *::after {
+    animation-duration: 0.01ms !important;
+    animation-iteration-count: 1 !important;
+    transition-duration: 0.01ms !important;
+    scroll-behavior: auto !important;
+  }
+
+  .reveal {
+    opacity: 1;
+    transform: none;
+  }
+}
