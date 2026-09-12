@@ -19,7 +19,7 @@ const { intro, projects } = portfolio.aiDevelopment
 
       <ul class="grid gap-6 sm:grid-cols-2">
         <li v-for="(project, index) in projects" :key="project.id" v-reveal="(index % 2) * 80">
-          <ProjectCard :project="project" badge="Built with Claude" />
+          <ProjectCard :project="project" badge="Built with Claude" stretched-link="source" />
         </li>
       </ul>
     </div>

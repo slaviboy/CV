@@ -1,13 +1,17 @@
 <script setup lang="ts">
 import { Download, Languages, MapPin } from '@lucide/vue'
+import { ref } from 'vue'
 
 import portrait from '@/assets/images/portrait.webp'
+import MatrixRain from '@/components/MatrixRain.vue'
 import SectionHeading from '@/components/SectionHeading.vue'
 import { portfolio } from '@/data/portfolio'
 import { vReveal } from '@/directives/reveal'
 
 const { profile, stats } = portfolio
 const cvUrl = profile.cvPdfPath ? `${import.meta.env.BASE_URL}${profile.cvPdfPath}` : undefined
+
+const isPortraitHovered = ref(false)
 </script>
 
 <template>
@@ -21,15 +25,27 @@ const cvUrl = profile.cvPdfPath ? `${import.meta.env.BASE_URL}${profile.cvPdfPat
             class="absolute -inset-3 -z-10 rounded-[1.75rem] border border-dashed border-accent-line"
             aria-hidden="true"
           />
-          <img
-            :src="portrait"
-            :alt="`Portrait of ${profile.name}`"
-            width="408"
-            height="612"
-            loading="lazy"
-            decoding="async"
-            class="aspect-4/5 w-full rounded-2xl border border-line bg-surface-2 object-cover object-top"
-          />
+          <div
+            class="relative aspect-4/5 w-full overflow-hidden rounded-2xl border border-line bg-surface-2"
+            @pointerenter="isPortraitHovered = true"
+            @pointerleave="isPortraitHovered = false"
+          >
+            <img
+              :src="portrait"
+              :alt="`Portrait of ${profile.name}`"
+              width="408"
+              height="612"
+              loading="lazy"
+              decoding="async"
+              class="size-full object-cover object-top transition-[filter] duration-500"
+              :class="isPortraitHovered ? 'brightness-50' : 'brightness-100'"
+            />
+            <MatrixRain
+              :active="isPortraitHovered"
+              class="pointer-events-none absolute inset-0 transition-opacity duration-500"
+              :class="isPortraitHovered ? 'opacity-100' : 'opacity-0'"
+            />
+          </div>
         </figure>
 
         <div class="flex flex-col justify-center">

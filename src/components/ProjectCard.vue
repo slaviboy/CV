@@ -1,17 +1,24 @@
 <script setup lang="ts">
+import { computed } from 'vue'
 import { CirclePlay, Globe, Sparkles } from '@lucide/vue'
 
 import BrandIcon from '@/components/icons/BrandIcon.vue'
 import { useTheme } from '@/composables/useTheme'
 import type { Project, ProjectLinkKind } from '@/types/portfolio'
 
-defineProps<{
+const props = defineProps<{
   project: Project
   /** Optional label shown over the screenshot, e.g. "Built with Claude". */
   badge?: string
+  /** When set, the whole card links to the matching link kind (e.g. the GitHub source). */
+  stretchedLink?: ProjectLinkKind
 }>()
 
 const { isDark } = useTheme()
+
+const stretchedLinkUrl = computed(
+  () => props.project.links.find((link) => link.kind === props.stretchedLink)?.url,
+)
 
 const categoryLabel = { android: 'Android', web: 'Web' } as const
 
@@ -25,7 +32,7 @@ const linkDescription: Record<ProjectLinkKind, string> = {
 
 <template>
   <article
-    class="card group flex h-full flex-col overflow-hidden transition-[border-color,box-shadow,transform] duration-300 hover:-translate-y-1 hover:border-accent-line hover:shadow-xl hover:shadow-black/5 dark:hover:shadow-black/30"
+    class="card group relative flex h-full flex-col overflow-hidden transition-[border-color,box-shadow] duration-300 hover:border-accent-line hover:shadow-xl hover:shadow-black/5 dark:hover:shadow-black/30"
   >
     <div class="relative aspect-32/21 overflow-hidden border-b border-line bg-surface-2">
       <img
@@ -49,7 +56,19 @@ const linkDescription: Record<ProjectLinkKind, string> = {
 
     <div class="flex flex-1 flex-col p-6">
       <div class="flex items-center justify-between gap-3">
-        <h3 class="text-lg font-semibold tracking-tight text-fg">{{ project.name }}</h3>
+        <h3 class="text-lg font-semibold tracking-tight text-fg">
+          <a
+            v-if="stretchedLinkUrl"
+            :href="stretchedLinkUrl"
+            target="_blank"
+            rel="noopener noreferrer"
+            class="after:absolute after:inset-0 after:content-['']"
+          >
+            {{ project.name }}
+            <span class="sr-only">{{ linkDescription[stretchedLink!] }} (opens in a new tab)</span>
+          </a>
+          <template v-else>{{ project.name }}</template>
+        </h3>
         <span class="font-mono text-[11px] tracking-wider text-subtle uppercase">
           {{ categoryLabel[project.category] }}
         </span>
@@ -63,7 +82,7 @@ const linkDescription: Record<ProjectLinkKind, string> = {
 
       <ul
         v-if="project.links.length > 0"
-        class="mt-6 flex flex-wrap gap-x-5 gap-y-2 border-t border-line pt-5"
+        class="relative z-10 mt-6 flex flex-wrap gap-x-5 gap-y-2 border-t border-line pt-5"
       >
         <li v-for="link in project.links" :key="link.url">
           <a
