@@ -1,28 +1,13 @@
 <script setup lang="ts">
 /**
- * A pseudo-3D "Matrix" digital-rain world rendered around and blended into a source image.
- *
- * There's no real depth data for an arbitrary photo, and no WebGL here — this is a canvas-2D
- * approximation, deliberately built around a few tricks that make a flat scene read as having
- * depth:
- *
- * 1. Perspective projection (`project()`): every particle lives in a "world" x/y/z, and gets
- *    projected to screen space with `scale = focalLength / (focalLength + z)`, the standard
- *    pinhole-camera approximation. Farther particles (larger z) end up smaller, dimmer, and
- *    closer to the vanishing point.
- * 2. Six conceptual planes (background / midground / floor / left+right wall / foreground),
- *    each with different motion: "falling" planes move down in world-y at a fixed depth;
- *    "approaching" planes (floor, walls) instead move in z toward the camera, which is what
- *    actually reads as a receding floor/corridor once projected.
- * 3. Draw order does the occlusion work a real z-buffer would: far planes are drawn first with
- *    an additive blend (so they read as glow sitting *in* the scene rather than paint on top),
- *    the image sits in the middle, and the sparse foreground plane is drawn last with normal
- *    compositing so it can genuinely cover part of the photo.
- * 4. A static radial "depth field" keyed to the vanishing point (no per-frame image analysis)
- *    dims particles near the middle of the frame, so a face/subject there stays legible while
- *    the code thickens toward the edges.
+ * "Dissolve into the Matrix" hover effect: on hover, the photo fades out completely while a
+ * dense grid of falling code fades in — and that code isn't random noise over the photo, it's
+ * brightness-mapped *from* the photo (sampled once into a `columns x rows` grid matching the
+ * render grid), so the falling characters reconstruct the same face/silhouette rather than
+ * just decorating it. This is the same idea as the classic "face made of Matrix code" shots:
+ * dense code, near-black background, the subject legible only through where the code is bright.
  */
-import { computed, onBeforeUnmount, onMounted, useTemplateRef, watch } from 'vue'
+import { onBeforeUnmount, onMounted, useTemplateRef, watch } from 'vue'
 
 import { useReducedMotion } from '@/composables/useReducedMotion'
 
@@ -30,35 +15,21 @@ const props = withDefaults(
   defineProps<{
     src: string
     alt?: string
-    /** Master switch for the code layer — 0 fades to the plain photo, >0 fades it in. Toggling
-     * this smoothly dissolves in/out rather than reshuffling particles; it doesn't change how
-     * many particles exist, only how visible the (fixed-size) field currently is. */
+    /** 0 shows the plain photo; >0 dissolves it into the code grid. */
     intensity?: number
     speed?: number
-    /** Strength of the code's glow/blend over the photo, independent of particle density. */
+    /** Strength of the code layer once fully dissolved in. */
     opacity?: number
     fontSize?: number
     color?: string
-    /** Scales how far the background/floor/walls extend and how close the foreground gets. */
-    depth?: number
-    /** Scales perspective convergence — higher reads as a more dramatic, wide-angle depth. */
-    perspective?: number
-    vanishingPointX?: number
-    vanishingPointY?: number
-    interactive?: boolean
   }>(),
   {
     alt: '',
     intensity: 1,
     speed: 1,
-    opacity: 0.85,
-    fontSize: 14,
+    opacity: 1,
+    fontSize: 12,
     color: '#00ff66',
-    depth: 1,
-    perspective: 1,
-    vanishingPointX: 0.5,
-    vanishingPointY: 0.42,
-    interactive: true,
   },
 )
 
@@ -73,9 +44,7 @@ function randomChar() {
 
 function hexToRgb(hex: string) {
   const clean = hex.replace('#', '')
-  const full = clean.length === 3
-    ? clean.split('').map((c) => c + c).join('')
-    : clean.padEnd(6, '0')
+  const full = clean.length === 3 ? clean.split('').map((c) => c + c).join('') : clean.padEnd(6, '0')
   const value = parseInt(full, 16)
   return { r: (value >> 16) & 255, g: (value >> 8) & 255, b: value & 255 }
 }
@@ -88,167 +57,115 @@ function mix(a: { r: number; g: number; b: number }, b: { r: number; g: number; 
   }
 }
 
-const baseColor = computed(() => hexToRgb(props.color))
-const headColor = computed(() => mix(baseColor.value, { r: 255, g: 255, b: 255 }, 0.78))
-const dimColor = computed(() => mix(baseColor.value, { r: 0, g: 0, b: 0 }, 0.55))
+const baseColor = () => hexToRgb(props.color)
+const headColor = () => mix(baseColor(), { r: 255, g: 255, b: 255 }, 0.78)
 
 function rgbaOf(c: { r: number; g: number; b: number }, a: number) {
   return `rgba(${c.r},${c.g},${c.b},${Math.max(0, Math.min(1, a)).toFixed(3)})`
 }
 
-/** t=0 is the freshly-typed head, t=1 is the far end of the trail — matches the classic
- * bright-head/dim-green-tail Matrix look. */
-function sampleTrail(t: number) {
-  if (t < 0.12) return mix(headColor.value, baseColor.value, t / 0.12)
-  if (t < 0.55) return mix(baseColor.value, baseColor.value, 0)
-  return mix(baseColor.value, dimColor.value, (t - 0.55) / 0.45)
-}
-
 // ---------------------------------------------------------------------------------------------
-// Scene state
+// State
 // ---------------------------------------------------------------------------------------------
 
 let ctx: CanvasRenderingContext2D | null = null
 let width = 0
 let height = 0
-let dpr = 1
 
 let sourceImage: HTMLImageElement | null = null
 let imageReady = false
 
-interface FallingStream {
-  wx: number
-  wy: number
-  z: number
-  speed: number
-  tail: number
-  jitter: number
-}
+const sampleCanvas = document.createElement('canvas')
+const sampleContext = sampleCanvas.getContext('2d', { willReadFrequently: true })
 
-interface ApproachStream {
-  fixed: number // world position on the plane's fixed axis (wall: x offset, floor: y offset)
-  free: number // world position on the plane's free axis (wall: y, floor: x)
-  z: number
-  speed: number
-  tail: number
-}
+let columns = 0
+let rows = 0
+let luminance = new Float32Array(0)
+let headRow: number[] = []
+let colSpeed: number[] = []
+let colTail: number[] = []
+/** Each cell's currently-displayed glyph. Mostly stable (drawn every frame regardless of the
+ * falling head, so the face reads as a dense, present texture rather than a passing sliver) and
+ * rerolled occasionally for shimmer, with cells inside a column's falling head rerolled more. */
+let charGrid: string[] = []
 
-let background: FallingStream[] = []
-let midground: FallingStream[] = []
-let foreground: FallingStream[] = []
-let floor: ApproachStream[] = []
-let wallLeft: ApproachStream[] = []
-let wallRight: ApproachStream[] = []
-
-let worldW = 0
-let worldH = 0
-let zFar = 0
-let zMid = 0
-let zNear = 0
-
-const camera = { x: 0, y: 0, driftT: 0 }
-const pointer = { x: 0, y: 0, active: false }
-
-// How much of the code layer to show, eased toward `intensity > 0 ? 1 : 0` each frame — this is
-// what makes hover on/off read as a smooth dissolve instead of the particle field popping in.
-let codeIntro = 0
+// How dissolved into code the scene currently is: 0 = plain photo, 1 = full code. Eased toward
+// the intensity-derived target each frame so hover reads as a dissolve, not a hard cut.
+let transitionT = 0
 
 function rand(min: number, max: number) {
   return min + Math.random() * (max - min)
 }
 
-function makeFalling(count: number, zMin: number, zMax: number, speedMin: number, speedMax: number, tailMin: number, tailMax: number): FallingStream[] {
-  return Array.from({ length: count }, () => ({
-    wx: rand(-worldW / 2, worldW / 2),
-    wy: rand(-worldH / 2, worldH / 2),
-    z: rand(zMin, zMax),
-    speed: rand(speedMin, speedMax),
-    tail: Math.round(rand(tailMin, tailMax)),
-    jitter: Math.random() * 1000,
-  }))
-}
+/** Samples the photo down to one brightness value per grid cell, cover-fit + top-aligned to
+ * match `object-cover object-top`, then contrast-stretches and gamma-crushes it so a lit but
+ * non-black background (a wall, say) still reads as "background" once rendered as code density
+ * rather than washing out the silhouette. */
+function sampleLuminance() {
+  luminance = new Float32Array(columns * rows)
+  const image = sourceImage
+  if (!sampleContext || !image?.naturalWidth || !imageReady) {
+    luminance.fill(0.5)
+    return
+  }
 
-function makeApproach(count: number, freeMin: number, freeMax: number, fixed: number): ApproachStream[] {
-  return Array.from({ length: count }, () => ({
-    fixed: fixed * rand(0.85, 1.15),
-    free: rand(freeMin, freeMax),
-    z: rand(zMid, zFar),
-    speed: rand(0.55, 1.35),
-    tail: Math.round(rand(3, 5)),
-  }))
-}
+  sampleCanvas.width = columns
+  sampleCanvas.height = rows
+  sampleContext.clearRect(0, 0, columns, rows)
 
-function buildScene() {
-  worldW = width * 1.6
-  worldH = height * 1.6
-  zFar = 700 * props.depth
-  zMid = 320 * props.depth
-  zNear = 80 * props.depth
+  const scale = Math.max(columns / image.naturalWidth, rows / image.naturalHeight)
+  const dw = image.naturalWidth * scale
+  const dh = image.naturalHeight * scale
+  const dx = (columns - dw) / 2
+  sampleContext.drawImage(image, dx, 0, dw, dh)
 
-  // Particle *count* is fixed once built (scaled only by the canvas's own area, so a small
-  // card on mobile doesn't get the same count as a large desktop panel) — `intensity` instead
-  // controls how visible that fixed field is via `codeIntro`, so toggling it on hover fades
-  // the code in/out rather than reshuffling every particle's position each time.
-  const d = Math.min(1.6, Math.max(0.35, (width * height) / (420 * 520)))
+  const { data } = sampleContext.getImageData(0, 0, columns, rows)
+  const raw = new Float32Array(columns * rows)
+  for (let cell = 0; cell < raw.length; cell++) {
+    const i = cell * 4
+    raw[cell] = (0.2126 * data[i]! + 0.7152 * data[i + 1]! + 0.0722 * data[i + 2]!) / 255
+  }
 
-  background = makeFalling(Math.round(38 * d), zMid, zFar, 0.15, 0.35, 4, 6)
-  midground = makeFalling(Math.round(34 * d), zNear * 1.8, zMid, 0.35, 0.65, 5, 8)
-  foreground = makeFalling(Math.round(10 * d), zNear * 0.4, zNear, 0.7, 1.1, 5, 8)
-  floor = makeApproach(Math.round(36 * d), -worldW * 0.6, worldW * 0.6, worldH * 0.42)
-  wallLeft = makeApproach(Math.round(18 * d), -worldH * 0.5, worldH * 0.5, -worldW * 0.5)
-  wallRight = makeApproach(Math.round(18 * d), -worldH * 0.5, worldH * 0.5, worldW * 0.5)
-}
+  const sorted = Array.from(raw).sort((a, b) => a - b)
+  const cutoff = 0.015
+  const low = sorted[Math.floor(sorted.length * cutoff)] ?? 0
+  const high = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * (1 - cutoff)) - 1)] ?? 1
+  const range = Math.max(0.05, high - low)
 
-// ---------------------------------------------------------------------------------------------
-// Projection
-// ---------------------------------------------------------------------------------------------
-
-const focalLength = computed(() => 260 / Math.max(0.15, props.perspective))
-
-function project(wx: number, wy: number, z: number) {
-  const scale = focalLength.value / (focalLength.value + Math.max(1, z))
-  const vpX = props.vanishingPointX * width
-  const vpY = props.vanishingPointY * height
-  return {
-    x: vpX + (wx + camera.x) * scale,
-    y: vpY + (wy + camera.y) * scale,
-    scale,
+  for (let cell = 0; cell < raw.length; cell++) {
+    const stretched = Math.min(1, Math.max(0, (raw[cell]! - low) / range))
+    luminance[cell] = stretched ** 4
   }
 }
 
-/** Static radial field around the vanishing point — 0 there, ~1 toward the corners. Used to
- * keep a subject near the frame's focal point legible while the code thickens at the edges. */
-function edgeField(nx: number, ny: number) {
-  const dx = nx - props.vanishingPointX
-  const dy = ny - props.vanishingPointY
-  return Math.min(1, Math.hypot(dx, dy) * 1.5)
+function setupCanvas() {
+  const canvas = canvasRef.value
+  if (!canvas) return
+  const rect = canvas.getBoundingClientRect()
+  width = Math.max(1, rect.width)
+  height = Math.max(1, rect.height)
+
+  const dpr = Math.min(window.devicePixelRatio || 1, 2)
+  canvas.width = Math.round(width * dpr)
+  canvas.height = Math.round(height * dpr)
+  ctx = canvas.getContext('2d')
+  ctx?.setTransform(dpr, 0, 0, dpr, 0, 0)
+
+  columns = Math.max(1, Math.ceil(width / props.fontSize))
+  rows = Math.max(1, Math.ceil(height / props.fontSize))
+  headRow = Array.from({ length: columns }, () => rand(-rows, rows))
+  colSpeed = Array.from({ length: columns }, () => rand(0.12, 0.32))
+  colTail = Array.from({ length: columns }, () => Math.round(rand(5, 9)))
+  charGrid = Array.from({ length: columns * rows }, randomChar)
+
+  sampleLuminance()
 }
 
-/** Boosts a base alpha so far/dim glyphs are still legible against 'lighter' blending onto a
- * mid-brightness photo — plain linear alpha reads as near-invisible at these scales. */
-function punch(alpha: number) {
-  return Math.min(1, Math.pow(Math.max(0, alpha), 0.6) * 1.15)
-}
-
-// ---------------------------------------------------------------------------------------------
-// Update
-// ---------------------------------------------------------------------------------------------
-
-function updateFalling(list: FallingStream[], dt: number) {
-  for (const s of list) {
-    s.wy += s.speed * props.speed * dt * 60
-    if (s.wy > worldH / 2) {
-      s.wy = -worldH / 2 - Math.random() * worldH * 0.2
-      s.wx = rand(-worldW / 2, worldW / 2)
-    }
-  }
-}
-
-function updateApproach(list: ApproachStream[], dt: number) {
-  for (const s of list) {
-    s.z -= s.speed * props.speed * dt * 220
-    if (s.z < zNear * 0.3) {
-      s.z = zFar
+function updateColumns(dt: number) {
+  for (let i = 0; i < columns; i++) {
+    headRow[i]! += colSpeed[i]! * props.speed * dt * 60
+    if (headRow[i]! - colTail[i]! > rows) {
+      headRow[i] = rand(-rows * 0.4, 0)
     }
   }
 }
@@ -257,172 +174,96 @@ function updateApproach(list: ApproachStream[], dt: number) {
 // Draw
 // ---------------------------------------------------------------------------------------------
 
-function drawGlyphAt(x: number, y: number, size: number, alpha: number, color: { r: number; g: number; b: number }, glow: number) {
-  if (alpha <= 0.012 || size < 1.5) return
-  const c = ctx!
-  if (glow > 0) {
-    c.shadowColor = rgbaOf(baseColor.value, Math.min(1, alpha + 0.2))
-    c.shadowBlur = glow
-  } else {
-    c.shadowBlur = 0
-  }
-  c.font = `600 ${size.toFixed(1)}px ui-monospace, SFMono-Regular, Menlo, monospace`
-  c.fillStyle = rgbaOf(color, alpha)
-  c.fillText(randomChar(), x, y)
-}
-
-function drawFalling(list: FallingStream[], glow: number, opacityMul: number, edgeAware: boolean) {
-  const spacing = props.fontSize * 1.05
-  for (const s of list) {
-    for (let i = 0; i < s.tail; i++) {
-      const wy = s.wy - i * spacing
-      const p = project(s.wx, wy, s.z)
-      if (p.y < -40 || p.y > height + 40 || p.x < -40 || p.x > width + 40) continue
-
-      const t = i / Math.max(1, s.tail - 1)
-      const color = sampleTrail(t)
-      let alpha = (1 - t * 0.7) * p.scale * props.opacity * opacityMul
-      if (edgeAware) {
-        const nx = p.x / width
-        const ny = p.y / height
-        alpha *= 0.5 + edgeField(nx, ny) * 0.7
-      }
-      drawGlyphAt(p.x, p.y, props.fontSize * p.scale, punch(alpha), color, i === 0 ? glow : 0)
-    }
-  }
-}
-
-function drawFloor(list: ApproachStream[]) {
-  const zStep = 90 * props.depth
-  for (const s of list) {
-    for (let i = 0; i < s.tail; i++) {
-      const z = s.z + i * zStep
-      const p = project(s.free, s.fixed, z)
-      if (p.y < -20 || p.y > height + 20 || p.x < -40 || p.x > width + 40) continue
-
-      const closeness = 1 - Math.min(1, z / zFar)
-      const t = i / Math.max(1, s.tail - 1)
-      const color = sampleTrail(Math.min(1, t + (1 - closeness) * 0.4))
-      const alpha = (0.3 + closeness * 0.9) * p.scale * props.opacity * (1 - t * 0.4)
-      drawGlyphAt(p.x, p.y, props.fontSize * p.scale, punch(alpha), color, 0)
-    }
-  }
-}
-
-function drawWall(list: ApproachStream[]) {
-  const zStep = 70 * props.depth
-  for (const s of list) {
-    for (let i = 0; i < s.tail; i++) {
-      const z = s.z + i * zStep
-      const p = project(s.fixed, s.free, z)
-      if (p.y < -20 || p.y > height + 20 || p.x < -40 || p.x > width + 40) continue
-
-      const closeness = 1 - Math.min(1, z / zFar)
-      const t = i / Math.max(1, s.tail - 1)
-      const color = sampleTrail(Math.min(1, t + (1 - closeness) * 0.4))
-      const alpha = (0.25 + closeness * 0.75) * p.scale * props.opacity * (1 - t * 0.4)
-      drawGlyphAt(p.x, p.y, props.fontSize * p.scale, punch(alpha), color, 0)
-    }
-  }
-}
-
-/** Cover-fit + top-align, matching the CSS `object-cover object-top` a plain `<img>` would use. */
-function drawImage(elapsed: number) {
-  if (!ctx || !sourceImage || !imageReady) return
+/** Cover-fit + top-align, matching the `<img>` this replaces. */
+function drawPhoto(alpha: number) {
+  if (!ctx || !sourceImage || !imageReady || alpha <= 0.004) return
   const c = ctx
-
   const scale = Math.max(width / sourceImage.naturalWidth, height / sourceImage.naturalHeight)
   const dw = sourceImage.naturalWidth * scale
   const dh = sourceImage.naturalHeight * scale
-  const dx = (width - dw) / 2 + camera.x * 0.05 * codeIntro
-  const dy = camera.y * 0.05 * codeIntro
-
-  // Interpolate toward the "moody" grade as the code layer fades in, so the resting (unhovered)
-  // photo looks like a plain, untouched photo rather than always slightly darkened. The dip in
-  // brightness matters more than it might seem: on 'lighter'/additive blending, green glyphs
-  // only read clearly against a darkened backdrop — on the unmodified photo they wash out.
-  const moodFilter = `brightness(${(1 - 0.35 * codeIntro).toFixed(3)}) contrast(${(1 + 0.2 * codeIntro).toFixed(3)}) saturate(${(1 - 0.25 * codeIntro).toFixed(3)})`
-
+  const dx = (width - dw) / 2
   c.save()
-  c.filter = moodFilter
-  c.drawImage(sourceImage, dx, dy, dw, dh)
+  c.globalAlpha = alpha
+  c.drawImage(sourceImage, dx, 0, dw, dh)
   c.restore()
-
-  // Cheap chromatic-aberration stand-in: two colour-tinted, sub-pixel-offset copies blended
-  // additively. Kept faint — this should read as a lens artefact, not a glitch.
-  if (codeIntro > 0.01) {
-    c.save()
-    c.globalCompositeOperation = 'lighter'
-    c.filter = moodFilter
-    c.globalAlpha = 0.05 * codeIntro
-    c.drawImage(sourceImage, dx - 1, dy, dw, dh)
-    c.globalAlpha = 0.04 * codeIntro
-    c.drawImage(sourceImage, dx + 1, dy, dw, dh)
-    c.restore()
-
-    // Faint green light contamination from the surrounding "simulation".
-    c.save()
-    c.globalCompositeOperation = 'overlay'
-    c.fillStyle = rgbaOf(baseColor.value, (0.08 + Math.sin(elapsed / 900) * 0.015) * codeIntro)
-    c.fillRect(0, 0, width, height)
-    c.restore()
-  }
 }
 
-function drawNoiseAndFlicker(elapsed: number) {
-  if (!ctx || codeIntro <= 0.01) return
+function drawCode(alpha: number) {
+  if (!ctx || alpha <= 0.004) return
   const c = ctx
+  c.save()
+  c.globalAlpha = alpha
+  c.globalCompositeOperation = 'lighter'
+  c.font = `600 ${props.fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`
+  c.textBaseline = 'top'
 
-  // Sparse digital grain.
+  const head = headColor()
+  const base = baseColor()
+
+  // The whole grid is drawn every frame — that's what makes the face read as a dense, present
+  // texture rather than a thin falling sliver. Each column's moving head then boosts brightness
+  // and reroll frequency for the cells it currently passes through, layering motion on top.
+  for (let row = 0; row < rows; row++) {
+    for (let col = 0; col < columns; col++) {
+      const idx = row * columns + col
+      const luma = luminance[idx] ?? 0
+      if (luma <= 0.02) continue
+
+      const tail = colTail[col]!
+      const dist = headRow[col]! - row
+      const boost = dist >= 0 && dist < tail ? 1 - dist / tail : 0
+
+      if (Math.random() < (boost > 0.5 ? 0.35 : 0.02)) {
+        charGrid[idx] = randomChar()
+      }
+
+      const a = Math.min(1, luma * (0.55 + boost * 0.85))
+      if (boost > 0.6) {
+        c.shadowColor = rgbaOf(base, Math.min(1, luma))
+        c.shadowBlur = 3 + boost * 5
+        c.fillStyle = rgbaOf(mix(base, head, boost), a)
+      } else {
+        c.shadowBlur = 0
+        c.fillStyle = rgbaOf(base, a)
+      }
+      c.fillText(charGrid[idx] ?? randomChar(), col * props.fontSize, row * props.fontSize)
+    }
+  }
+
+  c.shadowBlur = 0
+  c.restore()
+}
+
+function drawNoise(codeAlpha: number) {
+  if (!ctx || codeAlpha <= 0.05) return
+  const c = ctx
   c.save()
   c.globalCompositeOperation = 'screen'
-  c.fillStyle = rgbaOf(baseColor.value, 0.5)
-  const dots = Math.round(30 * Math.min(1.5, (width * height) / (420 * 520)))
+  c.fillStyle = rgbaOf(baseColor(), 0.5)
+  const dots = Math.round(24 * Math.min(1.6, (width * height) / (420 * 520)))
   for (let i = 0; i < dots; i++) {
-    if (Math.random() > 0.4) continue
-    c.globalAlpha = Math.random() * 0.12
+    if (Math.random() > 0.35) continue
+    c.globalAlpha = Math.random() * 0.1 * codeAlpha
     c.fillRect(Math.random() * width, Math.random() * height, 1, 1)
   }
   c.restore()
-
-  // A very occasional, very brief brightness dip — never a visible "jump".
-  const flicker = Math.random() < 0.01 ? 0.9 : 1
-  if (flicker < 1) {
-    c.save()
-    c.globalCompositeOperation = 'source-over'
-    c.fillStyle = `rgba(4,6,5,${(1 - flicker) * 0.5})`
-    c.fillRect(0, 0, width, height)
-    c.restore()
-  }
-  void elapsed
 }
 
-function render(elapsed: number) {
+function render() {
   if (!ctx) return
   const c = ctx
   c.clearRect(0, 0, width, height)
 
-  drawImage(elapsed)
+  // Solid backdrop first — as the photo's alpha drops toward 0, this is what's left behind it
+  // instead of the page showing through, and it's what the code layer sits on.
+  c.fillStyle = 'rgb(5 6 7)'
+  c.fillRect(0, 0, width, height)
 
-  if (codeIntro > 0.01) {
-    c.save()
-    c.globalAlpha = codeIntro
-    c.globalCompositeOperation = 'lighter'
-    drawFalling(background, 2, 0.8, true)
-    drawWall(wallLeft)
-    drawWall(wallRight)
-    drawFloor(floor)
-    drawFalling(midground, 4, 1.05, true)
-
-    c.globalCompositeOperation = 'source-over'
-    drawFalling(foreground, 11, 1.2, false)
-
-    drawNoiseAndFlicker(elapsed)
-    c.restore()
+  drawPhoto(1 - transitionT)
+  if (props.intensity > 0 || transitionT > 0.01) {
+    drawCode(transitionT * props.opacity)
+    drawNoise(transitionT)
   }
-
-  c.globalCompositeOperation = 'source-over'
-  c.shadowBlur = 0
 }
 
 // ---------------------------------------------------------------------------------------------
@@ -435,48 +276,18 @@ let visible = true
 let resizeObserver: ResizeObserver | null = null
 let intersectionObserver: IntersectionObserver | null = null
 
-function setupCanvas() {
-  const canvas = canvasRef.value
-  if (!canvas) return
-  const rect = canvas.getBoundingClientRect()
-  width = Math.max(1, rect.width)
-  height = Math.max(1, rect.height)
-  dpr = Math.min(window.devicePixelRatio || 1, 2)
-  canvas.width = Math.round(width * dpr)
-  canvas.height = Math.round(height * dpr)
-  ctx = canvas.getContext('2d')
-  ctx?.setTransform(dpr, 0, 0, dpr, 0, 0)
-  buildScene()
-}
-
 function frame(time: number) {
   const dt = lastTime ? Math.min(0.05, (time - lastTime) / 1000) : 0
   lastTime = time
 
-  camera.driftT += dt
-  const driftX = Math.sin(camera.driftT * 0.13) * 6
-  const driftY = Math.cos(camera.driftT * 0.1) * 4
-  const pointerPull = props.interactive && pointer.active ? 0.5 : 0
-  camera.x += ((driftX + pointer.x * 10 * pointerPull) - camera.x) * Math.min(1, dt * 2)
-  camera.y += ((driftY + pointer.y * 8 * pointerPull) - camera.y) * Math.min(1, dt * 2)
+  const target = props.intensity > 0 ? 1 : 0
+  transitionT += (target - transitionT) * Math.min(1, dt * 3.2)
+  if (Math.abs(target - transitionT) < 0.002) transitionT = target
 
-  const introTarget = props.intensity > 0 ? 1 : 0
-  codeIntro += (introTarget - codeIntro) * Math.min(1, dt * 3.5)
-  if (Math.abs(introTarget - codeIntro) < 0.002) codeIntro = introTarget
+  const stillActive = target > 0 || transitionT > 0.001
+  if (stillActive) updateColumns(dt)
 
-  // Nothing left to animate once the code layer has fully faded out and intensity is off —
-  // stop the loop rather than redrawing an unchanging photo at 60fps forever.
-  const stillActive = introTarget > 0 || codeIntro > 0.001
-  if (stillActive) {
-    updateFalling(background, dt)
-    updateFalling(midground, dt)
-    updateFalling(foreground, dt)
-    updateApproach(floor, dt)
-    updateApproach(wallLeft, dt)
-    updateApproach(wallRight, dt)
-  }
-
-  render(time)
+  render()
 
   if (stillActive) {
     frameId = requestAnimationFrame(frame)
@@ -490,8 +301,8 @@ function stop() {
   frameId = 0
 }
 
-/** Restarts the render loop without reshuffling particle positions — used to wake back up
- * from the idle-stop above, so re-hovering resumes the scene rather than resetting it. */
+/** Resumes the loop without rebuilding the grid — re-hovering should continue the scene, not
+ * reshuffle every column's position. */
 function resume() {
   if (frameId || reducedMotion.value || !visible || document.hidden) return
   lastTime = 0
@@ -503,24 +314,11 @@ function start() {
   setupCanvas()
   lastTime = 0
   if (reducedMotion.value) {
-    render(0)
+    render()
     return
   }
   if (!visible || document.hidden) return
   frameId = requestAnimationFrame(frame)
-}
-
-function onPointerMove(event: PointerEvent) {
-  const canvas = canvasRef.value
-  if (!canvas) return
-  const rect = canvas.getBoundingClientRect()
-  pointer.x = (event.clientX - rect.left) / rect.width - 0.5
-  pointer.y = (event.clientY - rect.top) / rect.height - 0.5
-  pointer.active = true
-}
-
-function onPointerLeave() {
-  pointer.active = false
 }
 
 function onVisibilityChange() {
@@ -534,22 +332,25 @@ function loadImage() {
   img.onload = () => {
     imageReady = true
     sourceImage = img
-    if (!frameId) render(0)
+    if (canvasRef.value) {
+      sampleLuminance()
+      if (!frameId) render()
+    }
   }
   img.src = props.src
   sourceImage = img
 }
 
 watch(() => props.src, loadImage)
-watch([() => props.depth, () => props.vanishingPointX, () => props.vanishingPointY], () => {
-  if (canvasRef.value) buildScene()
-})
 watch(
   () => props.intensity,
   (value) => {
     if (value > 0) resume()
   },
 )
+watch(() => props.fontSize, () => {
+  if (canvasRef.value) setupCanvas()
+})
 watch(reducedMotion, start)
 
 onMounted(() => {
@@ -567,10 +368,6 @@ onMounted(() => {
   if (wrapperRef.value) intersectionObserver.observe(wrapperRef.value)
 
   document.addEventListener('visibilitychange', onVisibilityChange)
-  if (props.interactive) {
-    window.addEventListener('pointermove', onPointerMove, { passive: true })
-    canvasRef.value?.addEventListener('pointerleave', onPointerLeave)
-  }
 })
 
 onBeforeUnmount(() => {
@@ -578,8 +375,6 @@ onBeforeUnmount(() => {
   resizeObserver?.disconnect()
   intersectionObserver?.disconnect()
   document.removeEventListener('visibilitychange', onVisibilityChange)
-  window.removeEventListener('pointermove', onPointerMove)
-  canvasRef.value?.removeEventListener('pointerleave', onPointerLeave)
 })
 </script>
 
@@ -603,18 +398,18 @@ onBeforeUnmount(() => {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  background: radial-gradient(ellipse at 50% 42%, transparent 45%, rgb(0 0 0 / 0.35) 100%);
+  background: radial-gradient(ellipse at 50% 40%, transparent 40%, rgb(0 0 0 / 0.45) 100%);
 }
 
 .matrix-world__scanlines {
   position: absolute;
   inset: 0;
   pointer-events: none;
-  opacity: 0.5;
+  opacity: 0.4;
   background: repeating-linear-gradient(
     to bottom,
-    rgb(0 0 0 / 0.12) 0,
-    rgb(0 0 0 / 0.12) 1px,
+    rgb(0 0 0 / 0.14) 0,
+    rgb(0 0 0 / 0.14) 1px,
     transparent 1px,
     transparent 3px
   );

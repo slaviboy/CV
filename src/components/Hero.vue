@@ -154,7 +154,7 @@ function typeStep() {
   }
 
   const nextChar = flatText[revealCount.value] ?? ''
-  if (!typoChar.value && /[a-zA-Z]/.test(nextChar) && Math.random() < 0.1) {
+  if (!typoChar.value && /[a-zA-Z]/.test(nextChar) && Math.random() < 0.02) {
     typoChar.value = typoFor(nextChar)
     schedule(fixTypoStep, 130 + Math.random() * 180)
     return
