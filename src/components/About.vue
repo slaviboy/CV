@@ -3,6 +3,7 @@ import { Download, Languages, MapPin } from '@lucide/vue'
 import { ref } from 'vue'
 
 import portrait from '@/assets/images/portrait.webp'
+import portraitMask from '@/assets/images/portrait-mask.webp'
 import MatrixWorld from '@/components/MatrixWorld.vue'
 import SectionHeading from '@/components/SectionHeading.vue'
 import { portfolio } from '@/data/portfolio'
@@ -32,6 +33,7 @@ const isPortraitHovered = ref(false)
           >
             <MatrixWorld
               :src="portrait"
+              :mask-src="portraitMask"
               :alt="`Portrait of ${profile.name}`"
               :intensity="isPortraitHovered ? 1 : 0"
               :opacity="0.85"

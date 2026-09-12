@@ -14,6 +14,9 @@ import { useReducedMotion } from '@/composables/useReducedMotion'
 const props = withDefaults(
   defineProps<{
     src: string
+    /** A cutout of the same photo — subject on a flat white fill, same crop/dimensions as `src`.
+     * Used only to work out which cells belong to the person; brightness still comes from `src`. */
+    maskSrc?: string
     alt?: string
     /** 0 shows the plain photo; >0 dissolves it into the code grid. */
     intensity?: number
@@ -24,11 +27,12 @@ const props = withDefaults(
     color?: string
   }>(),
   {
+    maskSrc: '',
     alt: '',
     intensity: 1,
     speed: 1,
     opacity: 1,
-    fontSize: 12,
+    fontSize: 10,
     color: '#00ff66',
   },
 )
@@ -74,13 +78,65 @@ let height = 0
 
 let sourceImage: HTMLImageElement | null = null
 let imageReady = false
+let maskImage: HTMLImageElement | null = null
+let maskReady = false
 
 const sampleCanvas = document.createElement('canvas')
 const sampleContext = sampleCanvas.getContext('2d', { willReadFrequently: true })
+const medCanvas = document.createElement('canvas')
+const medContext = medCanvas.getContext('2d', { willReadFrequently: true })
+const maskCanvas = document.createElement('canvas')
+const maskContext = maskCanvas.getContext('2d', { willReadFrequently: true })
+const downA = document.createElement('canvas')
+const downACtx = downA.getContext('2d', { willReadFrequently: true })
+const downB = document.createElement('canvas')
+const downBCtx = downB.getContext('2d', { willReadFrequently: true })
+
+/** Downscales in halving steps rather than one big jump — plain bilinear on a >4x reduction
+ * aliases badly (lets fine background noise through instead of averaging it away), which is
+ * exactly the noise `sampleLuminance` is trying to suppress. Chaining ~2x steps approximates a
+ * proper box filter using only what canvas 2D gives us for free. */
+function progressiveDownscale(source: HTMLCanvasElement, targetW: number, targetH: number) {
+  let curCanvas: HTMLCanvasElement = source
+  let curW = source.width
+  let curH = source.height
+  let useA = true
+
+  while (curW > targetW * 2 && curH > targetH * 2) {
+    const nextW = Math.max(targetW, Math.round(curW / 2))
+    const nextH = Math.max(targetH, Math.round(curH / 2))
+    const dest = useA ? downA : downB
+    const destCtx = useA ? downACtx : downBCtx
+    if (!destCtx) break
+    dest.width = nextW
+    dest.height = nextH
+    destCtx.imageSmoothingEnabled = true
+    destCtx.imageSmoothingQuality = 'high'
+    destCtx.clearRect(0, 0, nextW, nextH)
+    destCtx.drawImage(curCanvas, 0, 0, nextW, nextH)
+    curCanvas = dest
+    curW = nextW
+    curH = nextH
+    useA = !useA
+  }
+
+  sampleCanvas.width = targetW
+  sampleCanvas.height = targetH
+  if (sampleContext) {
+    sampleContext.imageSmoothingEnabled = true
+    sampleContext.imageSmoothingQuality = 'high'
+    sampleContext.clearRect(0, 0, targetW, targetH)
+    sampleContext.drawImage(curCanvas, 0, 0, targetW, targetH)
+  }
+  return sampleContext
+}
 
 let columns = 0
 let rows = 0
 let luminance = new Float32Array(0)
+/** How "foreground" each cell is (from the mask alpha) — separate from `luminance` (which
+ * drives brightness/color) so it can also drive depth cues: glyph scale, glow, and parallax. */
+let depthMask = new Float32Array(0)
 let headRow: number[] = []
 let colSpeed: number[] = []
 let colTail: number[] = []
@@ -93,48 +149,110 @@ let charGrid: string[] = []
 // the intensity-derived target each frame so hover reads as a dissolve, not a hard cut.
 let transitionT = 0
 
+// Mouse parallax: the person (high depthMask) shifts noticeably, the background barely moves —
+// that differential is what sells "depth" rather than everything being one flat plane.
+const PARALLAX_PX = 7
+const pointerTarget = { x: 0, y: 0 }
+const pointer = { x: 0, y: 0 }
+
 function rand(min: number, max: number) {
   return min + Math.random() * (max - min)
 }
 
-/** Samples the photo down to one brightness value per grid cell, cover-fit + top-aligned to
- * match `object-cover object-top`, then contrast-stretches and gamma-crushes it so a lit but
- * non-black background (a wall, say) still reads as "background" once rendered as code density
- * rather than washing out the silhouette. */
+/** Percentile-stretches `raw` to its own min/max then applies a gamma curve, so each signal is
+ * normalized to its own range before the two are combined. `lowCutoff` and `highCutoff` are
+ * independent so the noise floor can be raised without also compressing the bright end. */
+function stretchAndGamma(raw: Float32Array, lowCutoff: number, highCutoff: number, gamma: number) {
+  const sorted = Array.from(raw).sort((a, b) => a - b)
+  const low = sorted[Math.floor(sorted.length * lowCutoff)] ?? 0
+  const high = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * (1 - highCutoff)) - 1)] ?? 1
+  const range = Math.max(0.02, high - low)
+  const out = new Float32Array(raw.length)
+  for (let i = 0; i < raw.length; i++) {
+    out[i] = Math.min(1, Math.max(0, (raw[i]! - low) / range)) ** gamma
+  }
+  return out
+}
+
+/** Samples the photo down to one "how much code here" value per grid cell, cover-fit +
+ * top-aligned to match `object-cover object-top`. Brightness alone can't tell dark hair or a
+ * dark t-shirt from a dark background — it would suppress all three equally — so *where* the
+ * person is comes from the mask cutout's alpha channel (`maskSrc`: the subject cut out on a
+ * transparent background) instead of brightness. The background still gets a dim, ambient
+ * version of the same code (from the real photo's own brightness) so it doesn't go fully dark —
+ * the mask's job is to make the person pop brighter against it, not to erase everything else. */
 function sampleLuminance() {
   luminance = new Float32Array(columns * rows)
+  depthMask = new Float32Array(columns * rows)
   const image = sourceImage
-  if (!sampleContext || !image?.naturalWidth || !imageReady) {
+  if (!sampleContext || !medContext || !image?.naturalWidth || !imageReady) {
     luminance.fill(0.5)
     return
   }
 
-  sampleCanvas.width = columns
-  sampleCanvas.height = rows
-  sampleContext.clearRect(0, 0, columns, rows)
-
-  const scale = Math.max(columns / image.naturalWidth, rows / image.naturalHeight)
+  const medW = 220
+  const medH = Math.max(1, Math.round((medW * height) / width))
+  medCanvas.width = medW
+  medCanvas.height = medH
+  const scale = Math.max(medW / image.naturalWidth, medH / image.naturalHeight)
   const dw = image.naturalWidth * scale
   const dh = image.naturalHeight * scale
-  const dx = (columns - dw) / 2
-  sampleContext.drawImage(image, dx, 0, dw, dh)
+  const dx = (medW - dw) / 2
+  medContext.clearRect(0, 0, medW, medH)
+  medContext.drawImage(image, dx, 0, dw, dh)
 
-  const { data } = sampleContext.getImageData(0, 0, columns, rows)
-  const raw = new Float32Array(columns * rows)
-  for (let cell = 0; cell < raw.length; cell++) {
-    const i = cell * 4
-    raw[cell] = (0.2126 * data[i]! + 0.7152 * data[i + 1]! + 0.0722 * data[i + 2]!) / 255
+  const lumaCtx = progressiveDownscale(medCanvas, columns, rows)
+  const lumaSmall = lumaCtx?.getImageData(0, 0, columns, rows).data
+  if (!lumaSmall) {
+    luminance.fill(0.5)
+    return
   }
 
-  const sorted = Array.from(raw).sort((a, b) => a - b)
-  const cutoff = 0.015
-  const low = sorted[Math.floor(sorted.length * cutoff)] ?? 0
-  const high = sorted[Math.min(sorted.length - 1, Math.ceil(sorted.length * (1 - cutoff)) - 1)] ?? 1
-  const range = Math.max(0.05, high - low)
+  const rawLuma = new Float32Array(columns * rows)
+  for (let cell = 0; cell < rawLuma.length; cell++) {
+    const i = cell * 4
+    rawLuma[cell] = (0.2126 * lumaSmall[i]! + 0.7152 * lumaSmall[i + 1]! + 0.0722 * lumaSmall[i + 2]!) / 255
+  }
+  const lumaCurve = stretchAndGamma(rawLuma, 0.015, 0.015, 4)
 
-  for (let cell = 0; cell < raw.length; cell++) {
-    const stretched = Math.min(1, Math.max(0, (raw[cell]! - low) / range))
-    luminance[cell] = stretched ** 4
+  const mask = maskImage
+  if (!maskContext || !mask?.naturalWidth || !maskReady) {
+    // No mask loaded (yet) — fall back to brightness alone rather than showing nothing.
+    luminance.set(lumaCurve)
+    return
+  }
+
+  maskCanvas.width = medW
+  maskCanvas.height = medH
+  const maskScale = Math.max(medW / mask.naturalWidth, medH / mask.naturalHeight)
+  const mdw = mask.naturalWidth * maskScale
+  const mdh = mask.naturalHeight * maskScale
+  maskContext.clearRect(0, 0, medW, medH)
+  maskContext.drawImage(mask, (medW - mdw) / 2, 0, mdw, mdh)
+
+  const maskCtx = progressiveDownscale(maskCanvas, columns, rows)
+  const maskSmall = maskCtx?.getImageData(0, 0, columns, rows).data
+  if (!maskSmall) {
+    luminance.set(lumaCurve)
+    return
+  }
+
+  const rawMask = new Float32Array(columns * rows)
+  for (let cell = 0; cell < rawMask.length; cell++) {
+    const alpha = maskSmall[cell * 4 + 3]! / 255
+    // Smoothstep rather than the raw alpha — gives the depth cues (scale/glow/parallax below) a
+    // gentler transition at the silhouette edge instead of a hard step.
+    rawMask[cell] = alpha * alpha * (3 - 2 * alpha)
+  }
+  depthMask.set(rawMask)
+
+  // Dim, ambient rain over the whole frame (still shaped by the real photo's brightness, just
+  // faint) — then the mask blends in a much brighter, gamma-boosted version over the person, so
+  // it clearly pops out of the background rather than the background vanishing entirely.
+  for (let cell = 0; cell < luminance.length; cell++) {
+    const background = 0.05 + rawLuma[cell]! ** 1.4 * 0.22
+    const person = 0.5 + lumaCurve[cell]! * 0.5
+    luminance[cell] = background + (person - background) * rawMask[cell]!
   }
 }
 
@@ -188,45 +306,70 @@ function drawPhoto(alpha: number) {
   c.restore()
 }
 
+/** Two size/glow/parallax tiers — background (far) and person (near) — rather than a truly
+ * continuous per-cell scale, so `ctx.font` only changes twice a frame instead of once per glyph
+ * (font changes are one of the pricier canvas state changes). That's enough to read as depth:
+ * the person renders larger, glows, and shifts more with the mouse; the background stays small,
+ * flat, and nearly still. */
 function drawCode(alpha: number) {
   if (!ctx || alpha <= 0.004) return
   const c = ctx
   c.save()
   c.globalAlpha = alpha
   c.globalCompositeOperation = 'lighter'
-  c.font = `600 ${props.fontSize}px ui-monospace, SFMono-Regular, Menlo, monospace`
   c.textBaseline = 'top'
 
   const head = headColor()
   const base = baseColor()
+  const fg = props.fontSize
+  const bg = props.fontSize * 0.78
+  const parallaxBg = { x: pointer.x * PARALLAX_PX * 0.12, y: pointer.y * PARALLAX_PX * 0.12 }
+  const parallaxFg = { x: pointer.x * PARALLAX_PX, y: pointer.y * PARALLAX_PX }
 
   // The whole grid is drawn every frame — that's what makes the face read as a dense, present
   // texture rather than a thin falling sliver. Each column's moving head then boosts brightness
   // and reroll frequency for the cells it currently passes through, layering motion on top.
-  for (let row = 0; row < rows; row++) {
-    for (let col = 0; col < columns; col++) {
-      const idx = row * columns + col
-      const luma = luminance[idx] ?? 0
-      if (luma <= 0.02) continue
+  for (let pass = 0; pass < 2; pass++) {
+    const isForeground = pass === 1
+    c.font = `600 ${(isForeground ? fg : bg).toFixed(1)}px ui-monospace, SFMono-Regular, Menlo, monospace`
+    const parallax = isForeground ? parallaxFg : parallaxBg
 
-      const tail = colTail[col]!
-      const dist = headRow[col]! - row
-      const boost = dist >= 0 && dist < tail ? 1 - dist / tail : 0
+    for (let row = 0; row < rows; row++) {
+      for (let col = 0; col < columns; col++) {
+        const idx = row * columns + col
+        const depth = depthMask[idx] ?? 0
+        if (isForeground !== depth >= 0.5) continue
 
-      if (Math.random() < (boost > 0.5 ? 0.35 : 0.02)) {
-        charGrid[idx] = randomChar()
+        const luma = luminance[idx] ?? 0
+        if (luma <= 0.02) continue
+
+        const tail = colTail[col]!
+        const dist = headRow[col]! - row
+        const boost = dist >= 0 && dist < tail ? 1 - dist / tail : 0
+
+        if (Math.random() < (boost > 0.5 ? 0.35 : 0.02)) {
+          charGrid[idx] = randomChar()
+        }
+
+        const a = Math.min(1, luma * (0.55 + boost * 0.85))
+        // Shadow blur is one of the pricier canvas operations per draw call — keep it rare
+        // (only the animated "head" cells passing through), not a permanent per-cell cost across
+        // the whole silhouette. Size and brightness alone already carry most of the depth cue.
+        const glow = isForeground && boost > 0.6 ? boost * 5 : 0
+        if (glow > 0) {
+          c.shadowColor = rgbaOf(base, Math.min(1, luma))
+          c.shadowBlur = glow
+          c.fillStyle = rgbaOf(mix(base, head, boost), a)
+        } else {
+          c.shadowBlur = 0
+          c.fillStyle = rgbaOf(base, a)
+        }
+        c.fillText(
+          charGrid[idx] ?? randomChar(),
+          col * props.fontSize + parallax.x,
+          row * props.fontSize + parallax.y,
+        )
       }
-
-      const a = Math.min(1, luma * (0.55 + boost * 0.85))
-      if (boost > 0.6) {
-        c.shadowColor = rgbaOf(base, Math.min(1, luma))
-        c.shadowBlur = 3 + boost * 5
-        c.fillStyle = rgbaOf(mix(base, head, boost), a)
-      } else {
-        c.shadowBlur = 0
-        c.fillStyle = rgbaOf(base, a)
-      }
-      c.fillText(charGrid[idx] ?? randomChar(), col * props.fontSize, row * props.fontSize)
     }
   }
 
@@ -285,7 +428,12 @@ function frame(time: number) {
   if (Math.abs(target - transitionT) < 0.002) transitionT = target
 
   const stillActive = target > 0 || transitionT > 0.001
-  if (stillActive) updateColumns(dt)
+  if (stillActive) {
+    updateColumns(dt)
+    const lerp = Math.min(1, dt * 5)
+    pointer.x += (pointerTarget.x - pointer.x) * lerp
+    pointer.y += (pointerTarget.y - pointer.y) * lerp
+  }
 
   render()
 
@@ -326,6 +474,19 @@ function onVisibilityChange() {
   else start()
 }
 
+function onPointerMove(event: PointerEvent) {
+  const canvas = canvasRef.value
+  if (!canvas) return
+  const rect = canvas.getBoundingClientRect()
+  pointerTarget.x = (event.clientX - rect.left) / rect.width - 0.5
+  pointerTarget.y = (event.clientY - rect.top) / rect.height - 0.5
+}
+
+function onPointerLeave() {
+  pointerTarget.x = 0
+  pointerTarget.y = 0
+}
+
 function loadImage() {
   const img = new Image()
   imageReady = false
@@ -341,7 +502,28 @@ function loadImage() {
   sourceImage = img
 }
 
+function loadMaskImage() {
+  if (!props.maskSrc) {
+    maskReady = false
+    maskImage = null
+    return
+  }
+  const img = new Image()
+  maskReady = false
+  img.onload = () => {
+    maskReady = true
+    maskImage = img
+    if (canvasRef.value) {
+      sampleLuminance()
+      if (!frameId) render()
+    }
+  }
+  img.src = props.maskSrc
+  maskImage = img
+}
+
 watch(() => props.src, loadImage)
+watch(() => props.maskSrc, loadMaskImage)
 watch(
   () => props.intensity,
   (value) => {
@@ -355,6 +537,7 @@ watch(reducedMotion, start)
 
 onMounted(() => {
   loadImage()
+  loadMaskImage()
   start()
 
   resizeObserver = new ResizeObserver(() => start())
@@ -368,12 +551,16 @@ onMounted(() => {
   if (wrapperRef.value) intersectionObserver.observe(wrapperRef.value)
 
   document.addEventListener('visibilitychange', onVisibilityChange)
+  wrapperRef.value?.addEventListener('pointermove', onPointerMove)
+  wrapperRef.value?.addEventListener('pointerleave', onPointerLeave)
 })
 
 onBeforeUnmount(() => {
   stop()
   resizeObserver?.disconnect()
   intersectionObserver?.disconnect()
+  wrapperRef.value?.removeEventListener('pointermove', onPointerMove)
+  wrapperRef.value?.removeEventListener('pointerleave', onPointerLeave)
   document.removeEventListener('visibilitychange', onVisibilityChange)
 })
 </script>
