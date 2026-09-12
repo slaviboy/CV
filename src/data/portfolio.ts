@@ -76,8 +76,8 @@ export const portfolio: Portfolio = {
 
   // [site] About section
   stats: [
-    { value: '5+', label: 'Years of experience' },
-    { value: '13+', label: 'Completed projects' },
+    { value: '7+', label: 'Years of experience' },
+    { value: '20+', label: 'Completed projects' },
   ],
 
   // [site] Skills section + en.json, [pdf] Programming languages / Android related skills.
